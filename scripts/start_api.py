@@ -30,6 +30,19 @@ faulthandler.enable()
 from config.settings import settings  # noqa: E402
 
 
+def _lan_ip() -> str:
+    """获取本机局域网 IP（UDP connect 只用于选路由，不发数据包）。"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
 def build_frontend() -> bool:
     """构建 Vue 前端为静态文件"""
     frontend_dir = PROJECT_ROOT / "frontend"
@@ -109,10 +122,14 @@ def main():
     print("=" * 60)
     print(" 智慧问诊Agent系统 · 整合服务（单进程）")
     print("=" * 60)
-    print(f"  地址: http://localhost:{args.port}")
-    print(f"  界面: http://localhost:{args.port}/        （Vue 聊天界面）")
-    print(f"  文档: http://localhost:{args.port}/docs    （Swagger UI）")
-    print(f"  接口: http://localhost:{args.port}/api/consult")
+    print(" 访问地址（直接复制到浏览器打开）：")
+    print(f"   本机: http://localhost:{args.port}   （或 http://127.0.0.1:{args.port}，Vue 聊天界面）")
+    if args.host == "0.0.0.0":
+        print(f"   局域网: http://{_lan_ip()}:{args.port}   （同局域网其他设备）")
+    print(f"   接口文档: http://localhost:{args.port}/docs   （Swagger UI）")
+    print("-" * 60)
+    print(" 提示: 下方 uvicorn 打印的 0.0.0.0 是「监听地址」（监听所有网卡），")
+    print("       不是访问地址，Windows 浏览器打开它必报错；请用上方地址。")
     print("=" * 60)
 
     import uvicorn
