@@ -89,7 +89,7 @@ const INTENT_LABEL = {
         />
 
         <div class="bubble-ai">
-          <div class="ai-name">问诊助手</div>
+          <div class="ai-name">智慧问诊Agent系统</div>
 
           <!-- Markdown 正文 -->
           <div class="md" v-html="renderMarkdown(msg.content)"></div>

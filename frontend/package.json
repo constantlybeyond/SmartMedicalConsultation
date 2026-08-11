@@ -1,5 +1,5 @@
 {
-  "name": "medical-consultation-frontend",
+  "name": "smart-medical-consultation-frontend",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -17,6 +17,7 @@
     "vue": "^3.4.21"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@vitejs/plugin-vue": "^5.0.4",
     "vite": "^5.2.0"
   }

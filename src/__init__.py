@@ -1,3 +1,3 @@
 """
-Medical Consultation Assistant - Source Package
+SmartMedicalConsultation - Source Package
 """

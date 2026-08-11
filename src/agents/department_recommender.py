@@ -1,10 +1,11 @@
 """
 Department Recommender Agent
-三级回退推荐就诊科室：
-  Tier1 图谱精确匹配（症状→疾病→科室）
-  Tier2 向量模糊匹配（症状语义检索最近疾病/症状→科室）
-  Tier3 LLM 知识兜底（图谱/向量都没有时，靠大模型医学常识推荐）
-解决"知识图谱症状词表覆盖不足导致推荐为空"的问题（如"左眼疼痛/上睑肿胀"）。
+两级导诊 + 图谱兜底，推荐就诊科室：
+  Tier1 图谱候选（症状→疾病→科室 的宽松聚合）：作为可溯源参考喂给 LLM，含噪声，**不直接采用**。
+  Tier2 LLM 取舍（结合 症状 + 图谱候选 + 对话历史 做最终决策）：过滤噪声科室、图谱缺失时据医学常识补正；
+        明确就诊诉求（如拔牙→口腔科）无需症状也可直接给出。
+  兜底：LLM 返回空时回退 Tier1 图谱候选；两者皆空则置 needs_clarification 追问。
+解决"知识图谱症状词表覆盖不足导致推荐为空"的问题（如"左眼疼痛/上睑肿胀"）——由 Tier2 LLM 据医学常识补正。
 """
 
 import sys
@@ -53,7 +54,9 @@ class DepartmentRecommenderAgent:
 
     def __init__(self):
         self.llm = get_llm(temperature=0.1)
-        self.fallback_chain = self.llm.with_structured_output(DeptFallback)
+        # 显式指定 function_calling：langchain-openai 1.x 默认 method="json_schema"，
+        # DashScope 兼容接口不支持该 response_format（报 400 要求 messages 含 "json"）
+        self.fallback_chain = self.llm.with_structured_output(DeptFallback, method="function_calling")
 
     # ---------- Tier 1: 图谱精确 ----------
     def _tier_graph(self, symptoms: list[str]) -> list[str]:

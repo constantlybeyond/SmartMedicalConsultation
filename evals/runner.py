@@ -241,6 +241,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default=None, help="设置则走 E2E（POST {base_url}/api/consult）")
     ap.add_argument("--subset", default=None, help="只跑含该 tag 的用例（如 smoke）")
+    ap.add_argument("--limit", type=int, default=None, help="只跑前 N 条用例（快速回归，如 --limit 10）")
     ap.add_argument("--dataset", default=str(DATASET))
     ap.add_argument("--thr-intent", type=float, default=0.9)
     ap.add_argument("--thr-emergency", type=float, default=1.0)
@@ -249,8 +250,11 @@ def main():
     cases = [json.loads(l) for l in Path(args.dataset).read_text(encoding="utf-8").splitlines() if l.strip()]
     if args.subset:
         cases = [c for c in cases if args.subset in c.get("tags", [])]
+    if args.limit:
+        cases = cases[:args.limit]
     mode = f"E2E @ {args.base_url}" if args.base_url else "offline/core"
-    print(f"[EVAL] mode={mode}  cases={len(cases)}" + (f"  subset={args.subset}" if args.subset else ""))
+    print(f"[EVAL] mode={mode}  cases={len(cases)}" + (f"  subset={args.subset}" if args.subset else "")
+          + (f"  limit={args.limit}" if args.limit else ""))
 
     rows = []
     for c in cases:

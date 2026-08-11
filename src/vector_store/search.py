@@ -5,6 +5,7 @@ Provides VectorRetriever class for hybrid search (FAISS + Neo4j).
 
 import sys
 import json
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,7 @@ import faiss
 
 from config.settings import settings
 from config.paths import DATA_INDEXES_DIR
+from src.knowledge_graph.schema import NodeType
 from src.common.logger import setup_logger
 
 logger = setup_logger(__name__, "vector_search.log")
@@ -93,13 +95,63 @@ class VectorRetriever:
             raise FileNotFoundError(f"Entity mapping not found: {self.entities_path}")
 
     def _get_embedding_model(self):
-        """Lazy load embedding model"""
+        """Lazy load embedding model（只允许本地目录，禁止任何 HF Hub 网络回退）。
+
+        2026-08-08 bug 加固：
+        1) 相对路径必须锚定项目根目录解析——此前直接传 "models/bge-m3"，
+           依赖进程 CWD；一旦 CWD 不是项目根（IDE 启动、--reload 子进程、
+           其他目录启动脚本），本地目录找不到，SentenceTransformer 会把该字符串
+           当作 HF Hub repo_id 尝试联网下载（日志中的
+           "Repository Not Found ... huggingface.co/models/bge-m3"）。
+           网络不通时该下载会挂起数分钟（请求线程表现为无响应），
+           是「知识类提问卡死 10 分钟」的直接原因之一。
+        2) 本地目录不存在时立即抛错——绝不落到联网下载路径。
+        3) 导入 sentence_transformers/huggingface_hub **之前**设置离线环境变量
+           （HF 离线模式在 huggingface_hub import 时定型，必须在导入前设置）。
+        """
         if self.embedding_model is None:
+            import os
+
+            model_path = Path(settings.embedding_model_path)
+            if not model_path.is_absolute():
+                model_path = _project_root / model_path
+            if not model_path.is_dir():
+                raise FileNotFoundError(
+                    f"本地嵌入模型目录不存在: {model_path}。"
+                    f"请先将 BGE-M3 模型放到该目录（含 config.json/modules.json 等），"
+                    f"服务路径禁止联网回退下载。"
+                )
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
             from sentence_transformers import SentenceTransformer
-            logger.info(f"[MODEL] Loading BGE-M3 from {settings.embedding_model_path}")
-            self.embedding_model = SentenceTransformer(settings.embedding_model_path)
+            logger.info(f"[MODEL] Loading BGE-M3 from {model_path}")
+            self.embedding_model = SentenceTransformer(str(model_path))
             logger.info("[MODEL] BGE-M3 loaded")
         return self.embedding_model
+
+    def warmup(self) -> "VectorRetriever":
+        """启动预热：在主线程提前加载嵌入模型，并跑通一次 encode + FAISS 检索。
+
+        背景（2026-08-08 线上 bug）：若在 uvicorn 请求工作线程中**首次**
+        `import sentence_transformers`（连带首次加载 torch / pyarrow 的原生 DLL），
+        在完整服务进程上下文中会触发原生访问违例（故障模块 pyarrow 的 arrow.dll，
+        异常码 c0000005），整个进程被操作系统直接杀掉——没有 Python traceback，
+        try/except 无法捕获。表现为：任何"知识类"问题（路由到 MedicalKnowledgeAgent）
+        在该进程的第一次提问必然使服务闪退。
+        在服务启动前（uvicorn.run 之前）于主线程调用本方法即可确定性规避（已实测验证）。
+
+        附带收益：首条知识类请求不再承担 ~10-20s 的模型加载延迟。
+
+        Returns:
+            self（便于链式调用）
+        """
+        model = self._get_embedding_model()
+        vec = model.encode(["启动预热"], normalize_embeddings=True).astype("float32")
+        if self.index is not None and self.index.ntotal > 0:
+            self.index.search(vec, 1)  # 跑通一次 FAISS 检索，完成原生层初始化
+        logger.info(f"[WARMUP] embedding model ready (device={getattr(model, 'device', 'unknown')})")
+        return self
 
     def search(
         self,
@@ -230,7 +282,7 @@ class VectorRetriever:
     def search_medications(self, query: str, top_k: int = 5) -> list[dict]:
         """Search for medications only"""
         results = self.search(query, top_k * 2, use_graph=False)
-        return [r for r in results if r["type"] in ("Medication", "Drug")]
+        return [r for r in results if r["type"] in (NodeType.MEDICATION.value, "Drug")]
 
     # ============================================================
     # Entity Linking
@@ -318,6 +370,41 @@ class VectorRetriever:
         except Exception as e:
             logger.warning(f"[LINK] entity linking failed: {e}")
             return []
+
+
+# ============================================================
+# 进程级共享检索器（单例）
+# ============================================================
+# 此前每个请求都 new 一个 VectorRetriever：每次重读 FAISS 索引、每次重新加载
+# BGE-M3（约 10-20s/次），且「工作线程内首次 import sentence_transformers」
+# 曾引发原生崩溃（详见 VectorRetriever.warmup 文档）。改为进程级共享后：
+# 索引与模型只加载一次，服务路径上不再出现重型原生库的首次加载。
+
+_shared_retriever: Optional[VectorRetriever] = None
+_shared_lock = threading.Lock()
+
+
+def get_shared_retriever() -> VectorRetriever:
+    """返回进程级共享的 VectorRetriever（首次调用时创建并完成预热）。
+
+    线程安全；并发首次调用下最坏只会多加载一次模型，不会出错。
+    """
+    global _shared_retriever
+    if _shared_retriever is None:
+        with _shared_lock:
+            if _shared_retriever is None:
+                _shared_retriever = VectorRetriever().warmup()
+    return _shared_retriever
+
+
+def preload_embedding_stack() -> VectorRetriever:
+    """进程启动阶段调用（uvicorn.run 之前、主线程）：预加载向量检索栈。
+
+    创建并预热进程级共享检索器；背景详见 `VectorRetriever.warmup` 文档
+    （修复 2026-08-08「首条知识类提问导致整个服务进程原生崩溃」的 bug）。
+    失败时向上抛出异常，由调用方决定降级策略。
+    """
+    return get_shared_retriever()
 
 
 # ============================================================

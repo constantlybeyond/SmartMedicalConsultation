@@ -19,13 +19,16 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from src.common.logger import setup_logger
-from src.common.memory import memory
+from src.history.store import history_store
 from src.api.models import (
     ConsultationRequest,
     ConsultationResponse,
     HealthResponse,
     StatsResponse,
-    ErrorResponse
+    ErrorResponse,
+    ConversationListResponse,
+    ConversationDetailResponse,
+    DeleteConversationResponse
 )
 
 logger = setup_logger(__name__, "api.log")
@@ -73,7 +76,7 @@ def log_request(
         504: {"model": ErrorResponse}
     },
     tags=["问诊"],
-    summary="智能问诊接口",
+    summary="智慧问诊接口",
     description="接收用户问题，返回 AI 生成的医疗建议（30秒超时，5并发限制）"
 )
 async def consult(req: ConsultationRequest):
@@ -104,8 +107,8 @@ async def consult(req: ConsultationRequest):
             # Call Agent system with timeout
             from src.agents.graph import run
 
-            # 加载会话记忆（本轮之前的历史），实现多轮上下文
-            history = memory.get_history(req.session_id, n=10)
+            # 加载多轮上下文（三级命中：Redis 热缓存 → MySQL 回填）
+            history = history_store.load_context(req.session_id)
 
             try:
                 # Run in thread pool to not block event loop
@@ -141,13 +144,10 @@ async def consult(req: ConsultationRequest):
                     success=True
                 )
 
-                # 写入会话记忆（用户问 + 助手答 + 结构化信息），供下一轮使用
-                memory.add_turn(req.session_id, "user", req.query)
-                memory.add_turn(
-                    req.session_id, "assistant", response.answer,
-                    intent=response.intent,
-                    symptoms=response.symptoms,
-                    departments=response.departments,
+                # 双写对话历史（先 MySQL 再 Redis；任一失败降级，不使请求失败）
+                history_store.persist_turn(req.session_id, "user", req.query)
+                history_store.persist_turn(
+                    req.session_id, "assistant", response.answer, intent=response.intent
                 )
 
                 return response
@@ -187,8 +187,8 @@ async def consult(req: ConsultationRequest):
 
         err_answer = "抱歉，系统暂时无法处理您的请求。请稍后重试，或拨打医疗咨询热线 12320。"
         # 记录本轮，避免上下文断裂
-        memory.add_turn(req.session_id, "user", req.query)
-        memory.add_turn(req.session_id, "assistant", err_answer, intent="error")
+        history_store.persist_turn(req.session_id, "user", req.query)
+        history_store.persist_turn(req.session_id, "assistant", err_answer, intent="error")
 
         # Return friendly error
         return ConsultationResponse(
@@ -282,7 +282,7 @@ async def consult_stream(req: ConsultationRequest, request: Request):
         final_state = None
         try:
             async with app_state.request_semaphore:
-                history = memory.get_history(req.session_id, n=10)
+                history = history_store.load_context(req.session_id)
                 gen = run_stream(req.query, history)
                 while True:
                     # 先查客户端断开，再取下一块
@@ -336,13 +336,10 @@ async def consult_stream(req: ConsultationRequest, request: Request):
                 has_disclaimer=len(response.disclaimers) > 0,
                 success=True,
             )
-            # 写入会话记忆（与 /consult 一致），供下一轮多轮上下文
-            memory.add_turn(req.session_id, "user", req.query)
-            memory.add_turn(
-                req.session_id, "assistant", response.answer,
-                intent=response.intent,
-                symptoms=response.symptoms,
-                departments=response.departments,
+            # 双写对话历史（与 /consult 一致）
+            history_store.persist_turn(req.session_id, "user", req.query)
+            history_store.persist_turn(
+                req.session_id, "assistant", response.answer, intent=response.intent
             )
             yield _sse_format(response.model_dump_json(), event="answer")
 
@@ -467,3 +464,53 @@ async def stats():
         vector_index=vi_stats,
         api=api_stats
     )
+
+
+# ============================================================
+# 对话历史管理（Redis 热缓存 + MySQL 冷存储，讲义 §6）
+# 历史接口用 def 同步路由：FastAPI 自动放入线程池，匹配
+# store 层"MySQL 每请求新开连接、用完即关"的连接管理约定。
+# ============================================================
+
+@router.get(
+    "/conversations",
+    response_model=ConversationListResponse,
+    tags=["对话历史"],
+    summary="对话历史列表",
+    description="按 updated_at 倒序分页列出对话（LIMIT ≤ 200），读 MySQL"
+)
+def list_conversations(limit: int = 50):
+    """对话历史列表（左侧历史栏数据源）"""
+    return ConversationListResponse(
+        conversations=history_store.list_conversations(limit=min(max(limit, 1), 200))
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationDetailResponse,
+    tags=["对话历史"],
+    summary="恢复单个对话",
+    description="返回该对话全部消息（时间正序），读 MySQL"
+)
+def get_conversation(conversation_id: str):
+    """恢复单个对话（单击历史栏项时调用）"""
+    if not history_store.conversation_exists(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return ConversationDetailResponse(
+        conversation_id=conversation_id,
+        messages=history_store.get_messages(conversation_id),
+    )
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    response_model=DeleteConversationResponse,
+    tags=["对话历史"],
+    summary="删除对话",
+    description="同步清空 MySQL 两表 + 对应 Redis key"
+)
+def delete_conversation(conversation_id: str):
+    """删除对话（MySQL 与 Redis 同步清空）"""
+    history_store.delete_conversation(conversation_id)
+    return DeleteConversationResponse(deleted=conversation_id)

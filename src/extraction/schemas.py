@@ -339,8 +339,7 @@ class AffectsBodyPartRelation(BaseModel):
 
 class ForDiseaseRelation(BaseModel):
     """
-    治疗方案-疾病关系
-    Pattern: (t:Treatment)-[:FOR_DISEASE]->(d:Disease)
+    治疗方案-疾病关系（仅抽取层建模；辅助关系，不在图谱 RelationType 契约内，不入图）
     """
     treatment_name: str = Field(..., description="治疗方案名称")
     disease_name: str = Field(..., description="疾病名称")
@@ -357,8 +356,7 @@ class HandlesDiseaseRelation(BaseModel):
 
 class DiseaseRelatedRelation(BaseModel):
     """
-    疾病-疾病相关关系
-    Pattern: (d1:Disease)-[:RELATED_TO]->(d2:Disease)
+    疾病-疾病相关关系（仅抽取层建模；具体语义见 relation_type 字段，不入图）
     """
     disease1_name: str = Field(..., description="疾病1名称")
     disease2_name: str = Field(..., description="疾病2名称")

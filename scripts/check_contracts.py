@@ -189,6 +189,28 @@ def check_r1():
     else:
         ok("未知名字扫描：代码中类型名均出自枚举契约")
 
+    # 4) Cypher 中引用的关系名必须 ∈ 契约枚举（[:REL] 与 [r:REL] 两种写法）
+    #    —— Cypher 字符串难以枚举插值（花括号冲突），用扫描代替改写，检出力更强
+    allowed_rels = {rt.value for rt in RelationType}
+    cypher_rel_re = re.compile(r"\[\w*:([A-Z][A-Z_]+)\]")
+    bad_cypher = []
+    for f, rel in _iter_py_files():
+        text = f.read_text(encoding="utf-8")
+        for m in cypher_rel_re.finditer(text):
+            ls = text.rfind("\n", 0, m.start()) + 1
+            le = text.find("\n", m.start())
+            if "legacy-alias" in text[ls:le if le != -1 else len(text)]:
+                continue
+            name = m.group(1)
+            if name not in allowed_rels:
+                line_no = text.count("\n", 0, m.start()) + 1
+                bad_cypher.append(f"{rel}:{line_no} -> [:{name}]")
+    if bad_cypher:
+        for b in bad_cypher[:10]:
+            fail(f"Cypher 引用了契约之外的关系名：{b}")
+    else:
+        ok("Cypher 关系名引用：全部出自 RelationType 契约")
+
 
 # ============================================================
 # R3：前后端字段契约

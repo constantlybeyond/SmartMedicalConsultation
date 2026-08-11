@@ -217,7 +217,13 @@ def run_stream(query: str, history: list | None = None):
 # ============================================================
 
 def get_mermaid_diagram() -> str:
-    """Generate Mermaid diagram of the agent flow"""
+    """Generate Mermaid diagram of the agent flow.
+
+    注意：这是**静态示意图**，须与 build_graph() 的边保持一致（当前已对齐
+    route_by_intent / route_after_symptom，含 medication·无症状 → 医学知识 的二级路由）。
+    若担心再次漂移，可改用 LangGraph 自动导出 app.get_graph().draw_mermaid()
+    （节点为英文 id、无自定义配色，但永远与编译图同步）。
+    """
     return """
 ```mermaid
 graph TD
@@ -230,7 +236,8 @@ graph TD
     A -->|general| I[通用对话<br/>GeneralChat]
 
     B -->|appointment| C[科室推荐<br/>DepartmentRecommender]
-    B -->|medication| D[用药建议<br/>MedicationAdvisor]
+    B -->|medication 有症状| D[用药建议<br/>MedicationAdvisor]
+    B -->|medication 无症状| E
 
     C --> F[就医指导<br/>PreVisitAdvisor]
     F --> G

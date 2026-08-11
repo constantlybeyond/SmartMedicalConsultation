@@ -36,11 +36,14 @@ data/
 ### 1. 爬取数据
 
 ```bash
-# 爬取 100 条疾病数据（仅好大夫在线）
+# 默认爬取 500 条疾病数据（预定义 500 种常见疾病种子列表，寻医问药备用源自动补齐）
 python crawler/medical_crawler.py
 
-# 爬取 200 条疾病数据（使用寻医问药作为补充）
-python crawler/medical_crawler.py --max 200 --backup
+# 小批量验证（先跑通流程、确认解析质量，再全量扩采）
+python crawler/medical_crawler.py --max 200
+
+# 仅使用好大夫在线，不启用寻医问药备用源
+python crawler/medical_crawler.py --no-backup
 
 # 重新开始爬取（清除断点记录）
 python crawler/medical_crawler.py --reset
@@ -64,8 +67,11 @@ from crawler import MedicalCrawler
 # 创建爬虫实例
 crawler = MedicalCrawler()
 
-# 爬取 50 条疾病数据
-crawler.run(max_diseases=50, use_backup=False)
+# 默认爬取 500 条（预定义种子列表 + 备用源补齐）
+crawler.run()
+
+# 小批量验证：先爬 200 条确认解析质量
+# crawler.run(max_diseases=200)
 
 # 查看结果
 print(f"爬取了 {len(crawler.diseases)} 条疾病数据")

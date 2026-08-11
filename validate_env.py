@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Medical Consultation Assistant - Environment Validation Script
+SmartMedicalConsultation - Environment Validation Script
 Check all required environment configurations
 """
 
@@ -55,8 +55,8 @@ def check_python_version():
     else:
         print_error(f"Python version: {version_str} (requires 3.11.x)")
         print_info("Fix:")
-        print_info("  conda create -n mkg_project python=3.11")
-        print_info("  conda activate mkg_project")
+        print_info("  conda create -n smc_project python=3.11")
+        print_info("  conda activate smc_project")
         return False
 
 def check_required_packages():
@@ -354,7 +354,7 @@ def check_dashscope_api():
 
 def main():
     """Main function"""
-    print_header("Medical Consultation Assistant - Environment Validation")
+    print_header("SmartMedicalConsultation - Environment Validation")
 
     results = {
         'Python Version': check_python_version(),

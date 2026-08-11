@@ -3,6 +3,7 @@ Disease Entity Extractor
 Uses LLM to extract structured disease information from raw text.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
 
 from config.settings import settings
-from src.common.llm import get_llm
+from src.common.llm import get_extract_llm, get_llm
 from src.common.logger import setup_logger
 from src.common.utils import retry_on_error
 from src.extraction.schemas import (
@@ -67,6 +68,123 @@ class SimpleLLMOutput(BaseModel):
 logger = setup_logger(__name__, "extraction.log")
 
 
+# vLLM 微调模型专用指令：与训练数据（data/finetune/ft_extract.json）的 instruction
+# 逐字一致——原 system 提示词 + JSON 字段模板合并为一条指令。训练时 (instruction, input)
+# 渲染在同一侧，推理若拆成 system/user 两条消息会导致格式遵循退化（如漏逗号、JSON 畸形）。
+_VLLM_EXTRACT_INSTRUCTION = """你是一个专业的医疗信息抽取助手。请从以下文本中提取疾病及其相关信息。
+
+要求：
+1. 疾病名称使用标准医学术语
+2. 症状列表要完整，包含所有提到的症状
+3. 科室名称使用标准科室名称（如"心血管内科"而非"心内科"）
+4. 药物名称使用通用名（如"氨氯地平"而非商品名）
+5. 如果没有相关信息，对应字段返回空列表
+6. 严格按照 JSON 格式输出
+
+请以 JSON 格式输出，包含以下字段：
+{{
+    "disease": {{
+        "name": "疾病名称",
+        "description": "疾病描述",
+        "icd_code": "ICD编码（如知道）或 null"
+    }},
+    "symptoms": ["症状1", "症状2"],
+    "medications": ["药物1", "药物2"],
+    "departments": ["科室1"],
+    "examinations": ["检查1", "检查2"],
+    "treatments": ["治疗方案1"],
+    "body_parts": ["身体部位1"]
+}}"""
+
+
+# 指令模板里的占位示例：微调模型在字段本应为空时偶尔原样回声这些占位符，
+# 入图前统一过滤，避免图谱出现"治疗方案1"之类的垃圾节点
+_TEMPLATE_PLACEHOLDERS = {
+    "疾病名称", "疾病描述", "ICD编码（如知道）或 null",
+    "症状1", "症状2", "药物1", "药物2", "科室1",
+    "检查1", "检查2", "治疗方案1", "身体部位1",
+}
+
+
+def _drop_placeholders(items: list) -> list:
+    return [s for s in items if s and s not in _TEMPLATE_PLACEHOLDERS]
+
+
+# 云端主 LLM 抽取用的原版双消息提示词（EXTRACTION_MODEL_BASE_URL 留空时的默认路径）
+_CLOUD_EXTRACT_SYSTEM = """你是一个专业的医疗信息抽取助手。请从以下文本中提取疾病及其相关信息。
+
+要求：
+1. 疾病名称使用标准医学术语
+2. 症状列表要完整，包含所有提到的症状
+3. 科室名称使用标准科室名称（如"心血管内科"而非"心内科"）
+4. 药物名称使用通用名（如"氨氯地平"而非商品名）
+5. 如果没有相关信息，对应字段返回空列表
+6. 严格按照 JSON 格式输出"""
+
+_CLOUD_EXTRACT_USER = """请从以下文本中提取疾病信息：
+
+{text}
+
+请以 JSON 格式输出，包含以下字段：
+{{
+    "disease": {{
+        "name": "疾病名称",
+        "description": "疾病描述",
+        "icd_code": "ICD编码（如知道）或 null"
+    }},
+    "symptoms": ["症状1", "症状2"],
+    "medications": ["药物1", "药物2"],
+    "departments": ["科室1"],
+    "examinations": ["检查1", "检查2"],
+    "treatments": ["治疗方案1"],
+    "body_parts": ["身体部位1"]
+}}"""
+
+
+def build_cloud_extract_chain(temperature: float = 0.1):
+    """
+    云端主 LLM 抽取链（json_mode 结构化输出）。
+
+    两个用途：
+    1. EXTRACTION_MODEL_BASE_URL 留空时的默认抽取路径；
+    2. vLLM 微调模型抽取失败（失控生成/畸形 JSON）时的兜底，保证建图覆盖率。
+    """
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _CLOUD_EXTRACT_SYSTEM),
+        ("user", _CLOUD_EXTRACT_USER),
+    ])
+    return prompt | get_llm(temperature=temperature).with_structured_output(
+        SimpleLLMOutput,
+        method="json_mode"
+    )
+
+
+def _parse_simple_llm_output(raw) -> "SimpleLLMOutput":
+    """
+    手工解析微调模型的 JSON 输出。
+
+    vLLM 路径不使用 with_structured_output(method="json_mode")：实测 response_format
+    json_object 的引导解码会诱发微调模型失控生成（烧穿 max_tokens 后 finish_reason=length）。
+    裸调用时模型稳定收尾，但常给 JSON 包 ```json 围栏，这里做容错解析。
+    """
+    text = raw.content if hasattr(raw, "content") else str(raw)
+    text = text.strip()
+
+    # 去掉 ```json ... ``` Markdown 围栏
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+
+    # 容错截取第一个 { 到最后一个 }
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError(f"No JSON object in model output: {text[:120]!r}")
+
+    data = json.loads(text[start:end + 1])
+    return SimpleLLMOutput(**data)
+
+
 class DiseaseExtractor:
     """
     疾病实体抽取器
@@ -87,43 +205,27 @@ class DiseaseExtractor:
         Args:
             temperature: LLM 温度参数，抽取任务建议低温度（0.1-0.3）
         """
-        self.llm = get_llm(temperature=temperature)
+        # 抽取专用入口：EXTRACTION_MODEL_BASE_URL 非空走本地 vLLM 微调模型，为空自动回退云端 get_llm()
+        self.llm = get_extract_llm(temperature=temperature)
 
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """你是一个专业的医疗信息抽取助手。请从以下文本中提取疾病及其相关信息。
-
-要求：
-1. 疾病名称使用标准医学术语
-2. 症状列表要完整，包含所有提到的症状
-3. 科室名称使用标准科室名称（如"心血管内科"而非"心内科"）
-4. 药物名称使用通用名（如"氨氯地平"而非商品名）
-5. 如果没有相关信息，对应字段返回空列表
-6. 严格按照 JSON 格式输出"""),
-            ("user", """请从以下文本中提取疾病信息：
-
-{text}
-
-请以 JSON 格式输出，包含以下字段：
-{{
-    "disease": {{
-        "name": "疾病名称",
-        "description": "疾病描述",
-        "icd_code": "ICD编码（如知道）或 null"
-    }},
-    "symptoms": ["症状1", "症状2"],
-    "medications": ["药物1", "药物2"],
-    "departments": ["科室1"],
-    "examinations": ["检查1", "检查2"],
-    "treatments": ["治疗方案1"],
-    "body_parts": ["身体部位1"]
-}}""")
-        ])
-
-        # Use structured output with simple schema for easier LLM generation
-        self.chain = self.prompt | self.llm.with_structured_output(
-            SimpleLLMOutput,
-            method="json_mode"
-        )
+        if settings.extraction_model_base_url.strip():
+            # vLLM 微调模型分支：消息结构与训练数据对齐（完整 instruction 作 system，
+            # 纯疾病文本作 user），裸调用 + 手工解析（json_mode 引导解码会诱发失控生成）
+            self.prompt = ChatPromptTemplate.from_messages([
+                ("system", _VLLM_EXTRACT_INSTRUCTION),
+                ("user", "{text}"),
+            ])
+            self.chain = self.prompt | self.llm | _parse_simple_llm_output
+        else:
+            # 云端主 LLM 分支：原有双消息提示词 + json_mode 结构化输出
+            self.prompt = ChatPromptTemplate.from_messages([
+                ("system", _CLOUD_EXTRACT_SYSTEM),
+                ("user", _CLOUD_EXTRACT_USER),
+            ])
+            self.chain = self.prompt | self.llm.with_structured_output(
+                SimpleLLMOutput,
+                method="json_mode"
+            )
 
     def _convert_to_result(self, simple: SimpleLLMOutput) -> DiseaseExtractionResult:
         """Convert simple LLM output to full DiseaseExtractionResult"""
@@ -134,23 +236,13 @@ class DiseaseExtractor:
             icd_code=simple.disease.icd_code,
         )
 
-        # Build symptom entities
-        symptoms = [SymptomEntity(name=s) for s in simple.symptoms if s]
-
-        # Build medication entities
-        medications = [MedicationEntity(name=m) for m in simple.medications if m]
-
-        # Build department entities
-        departments = [DepartmentEntity(name=d) for d in simple.departments if d]
-
-        # Build examination entities
-        examinations = [ExaminationEntity(name=e) for e in simple.examinations if e]
-
-        # Build treatment entities
-        treatments = [TreatmentEntity(name=t) for t in simple.treatments if t]
-
-        # Build body part entities
-        body_parts = [BodyPartEntity(name=bp) for bp in simple.body_parts if bp]
+        # 各类实体统一过滤模板占位符回声（如"治疗方案1"）
+        symptoms = [SymptomEntity(name=s) for s in _drop_placeholders(simple.symptoms)]
+        medications = [MedicationEntity(name=m) for m in _drop_placeholders(simple.medications)]
+        departments = [DepartmentEntity(name=d) for d in _drop_placeholders(simple.departments)]
+        examinations = [ExaminationEntity(name=e) for e in _drop_placeholders(simple.examinations)]
+        treatments = [TreatmentEntity(name=t) for t in _drop_placeholders(simple.treatments)]
+        body_parts = [BodyPartEntity(name=bp) for bp in _drop_placeholders(simple.body_parts)]
 
         # Build relations
         has_symptom_relations = [

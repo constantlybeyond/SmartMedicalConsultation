@@ -37,7 +37,7 @@ RELATIONS_FILE = DATA_KG_DIR / "relations.json"
 # ============================================================
 
 NODE_CYPHER_TEMPLATES = {
-    "Disease": """
+    NodeType.DISEASE.value: """
         MERGE (n:Disease {name: $name})
         ON CREATE SET
             n.description = $description,
@@ -48,7 +48,7 @@ NODE_CYPHER_TEMPLATES = {
             n.icd_code = coalesce($icd_code, n.icd_code),
             n.updated_at = datetime()
     """,
-    "Symptom": """
+    NodeType.SYMPTOM.value: """
         MERGE (n:Symptom {name: $name})
         ON CREATE SET
             n.description = $description,
@@ -57,7 +57,7 @@ NODE_CYPHER_TEMPLATES = {
             n.description = coalesce($description, n.description),
             n.severity = coalesce($severity, n.severity)
     """,
-    "Medication": """
+    NodeType.MEDICATION.value: """
         MERGE (n:Medication {name: $name})
         ON CREATE SET
             n.category = $category,
@@ -68,7 +68,8 @@ NODE_CYPHER_TEMPLATES = {
             n.side_effects = coalesce($side_effects, n.side_effects),
             n.contraindications = coalesce($contraindications, n.contraindications)
     """,
-    # Alias for backward compatibility
+    # Alias for backward compatibility  # legacy-alias（旧抽取产物别名 → Medication 节点）
+    # 注意：注释必须放在字符串外——Cypher 不支持 # 注释，嵌入模板会导致 SyntaxError
     "Drug": """
         MERGE (n:Medication {name: $name})
         ON CREATE SET
@@ -80,7 +81,7 @@ NODE_CYPHER_TEMPLATES = {
             n.side_effects = coalesce($side_effects, n.side_effects),
             n.contraindications = coalesce($contraindications, n.contraindications)
     """,
-    "Department": """
+    NodeType.DEPARTMENT.value: """
         MERGE (n:Department {name: $name})
         ON CREATE SET
             n.description = $description,
@@ -88,7 +89,7 @@ NODE_CYPHER_TEMPLATES = {
         ON MATCH SET
             n.description = coalesce($description, n.description)
     """,
-    "Examination": """
+    NodeType.EXAMINATION.value: """
         MERGE (n:Examination {name: $name})
         ON CREATE SET
             n.type = $type,
@@ -96,6 +97,7 @@ NODE_CYPHER_TEMPLATES = {
         ON MATCH SET
             n.purpose = coalesce($purpose, n.purpose)
     """,
+    # aux（辅助抽取类型，不在 NodeType 核心契约）
     "Treatment": """
         MERGE (n:Treatment {name: $name})
         ON CREATE SET
@@ -103,7 +105,7 @@ NODE_CYPHER_TEMPLATES = {
         ON MATCH SET
             n.description = coalesce($description, n.description)
     """,
-    "BodyPart": """
+    NodeType.BODY_PART.value: """
         MERGE (n:BodyPart {name: $name})
         ON CREATE SET
             n.description = $description,
@@ -111,6 +113,7 @@ NODE_CYPHER_TEMPLATES = {
         ON MATCH SET
             n.description = coalesce($description, n.description)
     """,
+    # aux（辅助抽取类型，不在 NodeType 核心契约）
     "MedicalConcept": """
         MERGE (n:MedicalConcept {name: $name})
         ON CREATE SET
@@ -118,7 +121,7 @@ NODE_CYPHER_TEMPLATES = {
         ON MATCH SET
             n.definition = coalesce($definition, n.definition)
     """,
-    "Food": """
+    NodeType.FOOD.value: """
         MERGE (n:Food {name: $name})
         ON CREATE SET
             n.type = $type,
@@ -126,7 +129,7 @@ NODE_CYPHER_TEMPLATES = {
         ON MATCH SET
             n.description = coalesce($description, n.description)
     """,
-    "Precaution": """
+    NodeType.PRECAUTION.value: """
         MERGE (n:Precaution {content: $content})
         ON CREATE SET
             n.category = $category,
@@ -144,81 +147,83 @@ RELATION_TYPE_ALIASES = {
 }
 
 RELATION_CYPHER_TEMPLATES = {
-    "HAS_SYMPTOM": """
+    RelationType.HAS_SYMPTOM.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (s:Symptom {name: $symptom_name})
         MERGE (d)-[r:HAS_SYMPTOM]->(s)
         ON CREATE SET r.frequency = $frequency
     """,
-    "MAY_INDICATE": """
+    RelationType.MAY_INDICATE.value: """
         MATCH (s:Symptom {name: $symptom_name})
         MATCH (d:Disease {name: $disease_name})
         MERGE (s)-[r:MAY_INDICATE]->(d)
         ON CREATE SET r.probability = $probability
     """,
-    "BELONGS_TO_DEPARTMENT": """
+    RelationType.BELONGS_TO_DEPARTMENT.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (dep:Department {name: $department_name})
         MERGE (d)-[r:BELONGS_TO_DEPARTMENT]->(dep)
         ON CREATE SET r.priority = $priority
     """,
-    "TREATED_BY_MEDICATION": """
+    RelationType.TREATED_BY_MEDICATION.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (dr:Medication {name: $drug_name})
         MERGE (d)-[r:TREATED_BY_MEDICATION]->(dr)
         ON CREATE SET r.evidence_level = $evidence_level
     """,
-    "TREATS_DISEASE": """
+    RelationType.TREATS_DISEASE.value: """
         MATCH (dr:Medication {name: $drug_name})
         MATCH (d:Disease {name: $disease_name})
         MERGE (dr)-[r:TREATS_DISEASE]->(d)
     """,
-    "HAS_SIDE_EFFECT": """
+    RelationType.HAS_SIDE_EFFECT.value: """
         MATCH (dr:Medication {name: $drug_name})
         MATCH (s:Symptom {name: $symptom_name})
         MERGE (dr)-[r:HAS_SIDE_EFFECT]->(s)
         ON CREATE SET r.frequency = $frequency
     """,
-    "INTERACTS_WITH": """
+    RelationType.INTERACTS_WITH.value: """
         MATCH (dr1:Medication {name: $drug1_name})
         MATCH (dr2:Medication {name: $drug2_name})
         MERGE (dr1)-[r:INTERACTS_WITH]->(dr2)
         ON CREATE SET r.severity = $severity
     """,
-    "NEEDS_EXAMINATION": """
+    RelationType.NEEDS_EXAMINATION.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (e:Examination {name: $examination_name})
         MERGE (d)-[r:NEEDS_EXAMINATION]->(e)
         ON CREATE SET r.necessity = $necessity
     """,
-    "AFFECTS_BODY_PART": """
+    RelationType.AFFECTS_BODY_PART.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (bp:BodyPart {name: $body_part_name})
         MERGE (d)-[r:AFFECTS_BODY_PART]->(bp)
     """,
-    "FOR_DISEASE": """
-        MATCH (t:Treatment {name: $treatment_name})
-        MATCH (d:Disease {name: $disease_name})
-        MERGE (t)-[r:FOR_DISEASE]->(d)
-    """,
-    "HANDLES_DISEASE": """
+    RelationType.HANDLES_DISEASE.value: """
         MATCH (dep:Department {name: $department_name})
         MATCH (d:Disease {name: $disease_name})
         MERGE (dep)-[r:HANDLES_DISEASE]->(d)
     """,
-    "RECOMMENDS_FOOD": """
+    RelationType.RECOMMENDS_FOOD.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (f:Food {name: $food_name})
         MERGE (d)-[r:RECOMMENDS_FOOD]->(f)
         ON CREATE SET r.recommendation_type = $recommendation_type
     """,
-    "HAS_PRECAUTION": """
+    RelationType.HAS_PRECAUTION.value: """
         MATCH (d:Disease {name: $disease_name})
         MATCH (p:Precaution {content: $content})
         MERGE (d)-[r:HAS_PRECAUTION]->(p)
         ON CREATE SET r.importance = $importance
     """,
 }
+
+
+# R1 验收（导入即生效）：模板键必须全部出自契约枚举
+# （辅助类型 Treatment/MedicalConcept 与历史别名 Drug 例外，见 check_contracts 白名单）
+_AUX_NODE_TEMPLATE_KEYS = {"Treatment", "MedicalConcept", "Drug"}  # legacy-alias / aux
+assert set(NODE_CYPHER_TEMPLATES) <= {nt.value for nt in NodeType} | _AUX_NODE_TEMPLATE_KEYS,     f"节点模板键越界: {set(NODE_CYPHER_TEMPLATES) - {nt.value for nt in NodeType} - _AUX_NODE_TEMPLATE_KEYS}"
+assert set(RELATION_CYPHER_TEMPLATES) <= {rt.value for rt in RelationType},     f"关系模板键越界: {set(RELATION_CYPHER_TEMPLATES) - {rt.value for rt in RelationType}}"
 
 
 # ============================================================

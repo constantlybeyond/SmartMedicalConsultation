@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Medical Consultation Assistant - Web Crawler
+SmartMedicalConsultation - Web Crawler
 Crawl disease information from medical websites (haodf.com, xywy.com)
 Follows robots.txt compliance and crawler etiquette
 """
@@ -51,6 +51,7 @@ USER_AGENTS = [
 
 # ===== Predefined Disease List =====
 # Common diseases for medical knowledge graph (haodf.com pinyin slugs).
+# 共 500 种，覆盖主要科室，与默认爬取目标 --max 500 对齐。
 # 只允许 ASCII 拼音 slug（带音调/连字符的必然 404——URL 里出现非 ASCII 即非法）。
 # 无效 slug 是可容忍的：仅计为失败请求，不影响整体（有 xywy 备份源兜底）。
 COMMON_DISEASES = [
@@ -98,6 +99,108 @@ COMMON_DISEASES = [
     # 其他常见
     "pinxue", "guomin", "tangshang", "meiniuer", "zhongshu",
     "kouqiangkuiyang", "yachi", "manxingpilaoyu",
+    # 心血管(新增)
+    "xinjiaotong", "xinjigengsi", "xinlishuaijie", "xinfangchandong", "xindongguosu",
+    "xindongguohuan", "xinjiyan", "xinbaoyan", "ganranxingxinneimoyan", "kuozhangxingxinjibing",
+    "feihouxingxinjibing", "zhudongmaijiaceng", "zhudongmailiu", "shenjingmaixueshuan", "feishuanse",
+    "xiantianxingxinzangbing", "fangjiangequesun", "shijiangequesun", "dongmaidaoguanweibi", "faluosilianzheng",
+    "xinbaojiye", "dixueya", "bingtaidoufangjiezonghezheng", "yujizonghezheng", "erjianbanxiazhai",
+    "erjianbanguanbibuquan", "zhudongmaibanxiazhai", "leinuozonghezheng", "xueshuanbisexingmaiguanyan",
+    # 呼吸(新增)
+    "jixingzhiqiguanyan", "zhiqiguankuozhang", "feiqizhong", "feixinbing", "huxishuaijie",
+    "qixiong", "xiongqiangjiye", "feinongzhong", "feixianweihua", "jianzhixingfeiyan",
+    "chenfei", "feijiejie", "shanghuxidaoganran", "xiongmoyan", "dayexingfeiyan",
+    "zhiyuantifeiyan", "yiyuantifeiyan", "bingduxingfeiyan",
+    # 消化(新增)
+    "manxingweiyan", "weishiguanfanliubing", "fanliuxingshiguanyan", "shierzhichangkuiyang", "weixirou",
+    "changxirou", "keluoenbing", "kuiyangxingjiechangyan", "changyijizonghezheng", "lanweiyan",
+    "changgengzu", "fugugoushan", "xiaohuadaochuxie", "shiguanai", "jiechangai",
+    "zhichangai", "yixianai", "dannangjieshi", "danguanjieshi", "dannangxirou",
+    "youmenluoganjunganran", "xijunxingliji", "weichangyan", "jiujingxingganbing", "yaowuxinggansunshang",
+    "ganxueguanliu", "gannangzhong", "ganglou", "manxingdannangyan", "weixiachui",
+    # 内分泌(新增)
+    "yixingtangniaobing", "erxingtangniaobing", "renshentangniaobing", "tangniaobingzu", "tangniaobingshenbing",
+    "tangniaobingshiwangmobingbian", "dixuetang", "qiaobenjiazhuangxianyan", "jiazhuangxianai", "yajixingjiazhuangxianyan",
+    "jiazhuangpangxiangongnengkangjin", "kuxinzonghezheng", "shigexibaoliu", "chuitiliu", "zhiduanfeidazheng",
+    "niaobengzheng", "daixiezonghezheng", "gaoniaosuanxuezheng", "shenshangxianxianliu", "jiazhuangxiannangzhong",
+    "yuanfaxingquangutongzengduozheng", "jiazhuangxianliu",
+    # 神经精神(新增)
+    "piantoutong", "sanchashenjingtong", "zuogushenjingtong", "naogongxuebuzu", "naoyan",
+    "naomoyan", "bingduxingnaoyan", "aercihaimobing", "xueguanxingchidai", "chidai",
+    "duofaxingyinghua", "gelinbalizonghezheng", "zhouweishenjingbingbian", "moshaoshenjingyan", "zhiwushenjinggongnengwenluan",
+    "qiangpozheng", "kongjuzheng", "chuangshanghouyingjizhangai", "jingshenfenliezheng", "shuangxiangqingganzhangai",
+    "zaokuangzheng", "shenjingxingyanshi", "zibizheng", "ertongduodongzheng", "choudongzheng",
+    "fazuoxingshuibing", "buningtuizonghezheng", "tefaxingzhenchan", "xuanyun", "mianjijingluan",
+    "naojishui", "naotan", "shenjingshuairuo",
+    # 骨科(新增)
+    "guguanjieyan", "huamoyan", "huanangyan", "jianqiaoyan", "wanguanzonghezheng",
+    "zudijinmoyan", "genjianyan", "banyuebansunshang", "rendaisunshang", "guanjietuowei",
+    "jianxiusunshang", "yaozhuijianpantuchu", "yaozhuiguanxiazhai", "yaozhuihuatuo", "jizhucewan",
+    "gugutouhuaisi", "bianpingzu", "muwaifan", "gurouliu", "gusuiyan",
+    "ruanzuzhisunshang", "jiroulashang", "laozhen", "jixingyaoniushang", "jinmoyan",
+    "binguruanhuazheng",
+    # 风湿免疫(新增)
+    "leifengshiguanjieyan", "xitongxinghongbanlangchuang", "ganzaozonghezheng", "yingpibing", "pijiyan",
+    "duofaxingjiyan", "xueguanyan", "baisaibing", "dadongmaiyan", "fengshire",
+    "xianweijitong",
+    # 泌尿(新增)
+    "manxingshenyan", "shenbingzonghezheng", "shenshuaijie", "niaoduzheng", "shennangzhong",
+    "duonangshen", "shenjishui", "shuniaoguanjieshi", "pangguangjieshi", "pangguangyan",
+    "niaodaoyan", "qianliexianai", "shenai", "pangguangai", "gaowanyan",
+    "fugaoyan", "jingsuojingmaiquzhang", "baopiguochang", "baojing", "yingao",
+    "qiaomojiye", "niaoshijin", "jianzhixingshenyan",
+    # 皮肤(新增)
+    "daizhuangpaozhen", "danchunpaozhen", "shouzuxuan", "tixuan", "guxuan",
+    "jiaxuan", "jiechuang", "maonangyan", "jiezhong", "dandu",
+    "fengwozhiyan", "jiechuxingpiyan", "zhiyixingpiyan", "teyingxingpiyan", "shenjingxingpiyan",
+    "yaozhen", "duoxinghongban", "meiguikangzhen", "bianpingtaixian", "baidianfeng",
+    "huangheban", "queban", "pizhixiannangzhong", "pifusaoyangzheng", "yinxiebing",
+    "tianpaochuang", "xunchangyou", "bianpingyou", "jianruishiyou", "exingheisesuliu",
+    "hanpaozhen", "banhengeda", "manxingxunmazhen",
+    # 眼科(新增)
+    "sanguang", "laoshi", "ruoshi", "xieshi", "ganyanzheng",
+    "jiaomoyan", "jiaomokuiyang", "yizhuangnurou", "bolitihunzhuo", "feiwenzheng",
+    "shiwangmotuoluo", "huangbanbianxing", "shishenjingyan", "putaomoyan", "shayan",
+    "guominxingjiemoyan", "jianyuanyan", "daojie", "leinangyan", "yanwaishang",
+    "yuanzhuijiaomo",
+    # 耳鼻喉(新增)
+    "bidouyan", "bixirou", "bizhonggepianqu", "bichuxie", "shengdaixirou",
+    "shengdaixiaojie", "biantaotiyan", "manxingyanyan", "jixingyanyan", "xianyangtifeida",
+    "fenmixingzhongeryan", "huanongxingzhongeryan", "gumochuankong", "tufaxingerlong", "yundongbing",
+    "qiantingshenjingyan", "liangxingzhenfaxingweizhixingxuanyun", "biyanai",
+    # 妇科(新增)
+    "penqiangyan", "fujianyan", "zigongneimoyan", "zigongneimoyiweizheng", "zigongxianjizheng",
+    "zigongneimoai", "gongjingai", "luanchaoai", "waiyinyan", "meijunxingyindaoyan",
+    "dichongxingyindaoyan", "bijing", "tongjing", "jingqianqizonghezheng", "gengnianqizonghezheng",
+    "gongnengshitiaoxingzigongchuxie", "zigongtuochui", "buyunzheng", "xiguanxingliuchan", "renshengaoxueya",
+    "qianzhitaipan", "taipanzaobo", "chanhouchuxie", "ruxianzengsheng", "ruxianyan",
+    "ruxianxianweiliu", "ruxianjiejie", "chanhouyiyu",
+    # 儿科(新增)
+    "xinshengerhuangdan", "xinshengerfeiyan", "xiaoerxiaochuan", "xiaoerzhiqiguanyan", "xiaoerbianmi",
+    "xiaoeryanshi", "xiaoeryingyangbuliang", "xiaoernaotan", "gouloubing", "xiaoershanqi",
+    "xiaoerchangtaodie", "chuanqibing", "xiaoeryiniao", "aixiaozheng", "xingzaoshu",
+    "yingershizhen", "xiaoerjingfeng", "xinshengerbaixuezheng",
+    # 肿瘤(新增)
+    "naoliu", "baixuebing", "duofaxinggusuiliu", "zhifangliu", "xueguanliu",
+    "jitailiu", "shenjingmuxibaoliu", "shiwangmomuxibaoliu", "naomoliu", "tingshenjingliu",
+    # 传染病(新增)
+    "jiagan", "wugan", "mazhen", "fengzhen", "xinghongre",
+    "bairike", "liuxingxingsaixianyan", "yixingnaoyan", "nueji", "shanghan",
+    "kuangquanbing", "poshangfeng", "meidu", "linbing", "shengzhiqipaozhen",
+    "huichongbing", "gongxingchongbing", "naochongbing",
+    # 血液(新增)
+    "quetiexingpinxue", "juyouxibaoxingpinxue", "zaishengzhangaixingpinxue", "rongxuexingpinxue", "dizhonghaipinxue",
+    "guominxingzidian", "xuexiaobanjianshaoxingzidian", "xuexiaobanjianshaozheng", "xueyoubing", "gusuizengshengyichangzonghezheng",
+    "zhenxinghongxibaozengduozheng", "pigongnengkangjin",
+    # 口腔(新增)
+    "yazhouyan", "yayinyan", "quchi", "yasuiyan", "genjianzhouyan",
+    "zhichiguanzhouyan", "ekouchuang", "niexiaheguanjiewenluan", "kouchou", "moyazheng",
+    # 男科(新增)
+    "yangwei", "zaoxie", "nanxingbuyu", "xinggongnengzhangai", "yijing",
+    "guitouyan",
+    # 普外及其他(新增)
+    "shanqi", "danchunxingjiazhuangxianzhong", "linbajieyan", "shaoshang", "dongshang",
+    "ruchuang", "yajiankang", "dijiaxuezheng", "baixuezheng", "changzhanlian",
 ]
 
 
@@ -547,7 +650,7 @@ class MedicalCrawler:
 
     # ===== Main Crawl Logic =====
 
-    def run(self, max_diseases: int = 200, use_backup: bool = True, use_predefined: bool = True):
+    def run(self, max_diseases: int = 500, use_backup: bool = True, use_predefined: bool = True):
         """
         Run the crawler
 
@@ -648,7 +751,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Medical Website Crawler")
     parser.add_argument(
-        "--max", type=int, default=200, help="Maximum number of diseases to crawl (default: 200)"
+        "--max", type=int, default=500, help="Maximum number of diseases to crawl (default: 500)"
     )
     parser.add_argument(
         "--no-backup", action="store_true",

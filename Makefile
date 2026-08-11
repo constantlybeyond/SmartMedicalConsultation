@@ -1,5 +1,5 @@
 # 评估快捷入口。门禁由 evals/runner.py 的退出码决定（硬规则不达标 → 非 0）。
-# 用项目 Python 环境运行，例如：conda activate mkg_project && make eval-fast
+# 用项目 Python 环境运行，例如：conda activate smc_project && make eval-fast
 
 PY ?= python
 

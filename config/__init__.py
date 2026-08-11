@@ -1,5 +1,5 @@
 """
-Configuration module for Medical Consultation Assistant
+Configuration module for SmartMedicalConsultation
 """
 
 from .settings import settings

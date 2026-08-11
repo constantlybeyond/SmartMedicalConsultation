@@ -8,10 +8,16 @@
 -->
 <script setup>
 import { ref, nextTick, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import ChatMessage from '@/components/ChatMessage.vue'
 import DisclaimerBanner from '@/components/DisclaimerBanner.vue'
-import { consult, consultStream, health } from '@/api/index.js'
+import {
+  consult, consultStream, health,
+  listConversations, getConversation, deleteConversation
+} from '@/api/index.js'
+
+// localStorage 键：记住"当前看哪个对话"（数据唯一来源是后端）
+const SESSION_KEY = 'smc_session_id'
 
 // ---------- 状态 ----------
 const messages = ref([])
@@ -25,7 +31,10 @@ const newId = () =>
   typeof crypto !== 'undefined' && crypto.randomUUID
     ? crypto.randomUUID()
     : 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2)
-const sessionId = ref(newId())
+const sessionId = ref(localStorage.getItem(SESSION_KEY) || newId())
+
+// 对话历史列表（后端已倒序；前端只存元数据，内容点开才加载）
+const conversations = ref([])
 
 // 示例问题
 const sampleQuestions = [
@@ -115,6 +124,7 @@ async function send(text) {
   } finally {
     loading.value = false
     scrollBottom()
+    loadConversations()  // 每轮结束后刷新历史列表的顺序与标题
   }
 }
 
@@ -161,10 +171,88 @@ function newConversation() {
   if (loading.value) return
   messages.value = []
   sessionId.value = newId()
+  localStorage.setItem(SESSION_KEY, sessionId.value)
   sidebarOpen.value = false
 }
 
-onMounted(loadHealth)
+// ---------- 对话历史（后端 Redis+MySQL，前端只认 §6.2 契约） ----------
+async function loadConversations() {
+  try {
+    const { data } = await listConversations()
+    conversations.value = data.conversations || []
+  } catch {
+    conversations.value = []  // 后端历史服务不可用时不影响主聊天链路
+  }
+}
+
+// 把后端消息映射为 ChatMessage 可渲染的消息对象（缺省字段由组件 v-if 兜底）
+const toMsg = (m) => ({ role: m.role, content: m.content, intent: m.intent || '' })
+
+async function openConversation(id) {
+  if (loading.value || id === sessionId.value) return
+  try {
+    const { data } = await getConversation(id)
+    messages.value = (data.messages || []).map(toMsg)
+    sessionId.value = id
+    localStorage.setItem(SESSION_KEY, id)
+    sidebarOpen.value = false
+    scrollBottom()
+  } catch {
+    ElMessage.warning('恢复对话失败，该对话可能已被删除')
+    await loadConversations()
+  }
+}
+
+async function removeConversation(id) {
+  try {
+    await ElMessageBox.confirm('删除后无法恢复，确定删除该对话？', '删除对话', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+  } catch {
+    return  // 取消删除
+  }
+  try {
+    await deleteConversation(id)
+    if (id === sessionId.value) {  // 删的是当前对话 → 回欢迎页并发新 id
+      messages.value = []
+      sessionId.value = newId()
+      localStorage.setItem(SESSION_KEY, sessionId.value)
+    }
+    await loadConversations()
+    ElMessage.success('已删除对话')
+  } catch {
+    ElMessage.error('删除失败，请稍后重试')
+  }
+}
+
+// 刷新页面后恢复当前对话
+// ⚠️ 任何失败（404 / 网络错误 / 后端重启窗口）都不得更换会话 ID：
+// ID 由前端分配，后端在首条消息落库时才惰性创建 conversation。
+// 旧实现 catch 里 newId() 会导致「会话漂移」——首条消息落库前每次刷新都换新 ID，
+// 多轮上下文断裂，且侧边栏永远追不上正在进行的会话。
+async function restoreSession() {
+  const saved = localStorage.getItem(SESSION_KEY)
+  if (!saved) return
+  try {
+    const { data } = await getConversation(saved)
+    if ((data.messages || []).length) {
+      messages.value = data.messages.map(toMsg)
+      sessionId.value = saved
+      scrollBottom()
+    }
+    // 404（尚无消息落库）或空对话：保持原 ID 不变，等首条消息落库
+  } catch {
+    // 保持 saved ID 不变（sessionId 初始化时已取 localStorage 值）
+  }
+}
+
+onMounted(async () => {
+  loadHealth()
+  await loadConversations()
+  await restoreSession()
+})
 </script>
 
 <template>
@@ -187,7 +275,7 @@ onMounted(loadHealth)
         <div class="brand">
           <span class="brand-mark"><el-icon :size="24"><FirstAidKit /></el-icon></span>
           <div>
-            <h1 class="brand-name">问诊助手</h1>
+            <h1 class="brand-name">智慧问诊Agent系统</h1>
             <p class="brand-sub">智能医疗 · 知识图谱驱动</p>
           </div>
         </div>
@@ -196,6 +284,27 @@ onMounted(loadHealth)
           <el-icon><EditPen /></el-icon>
           开启新对话
         </button>
+
+        <div class="hist-block">
+          <div class="block-title">对话历史</div>
+          <div v-if="conversations.length === 0" class="hist-empty">暂无历史对话</div>
+          <div v-else class="hist-list">
+            <div
+              v-for="c in conversations"
+              :key="c.id"
+              class="hist-item"
+              :class="{ active: c.id === sessionId }"
+              :title="c.title"
+              @click="openConversation(c.id)"
+            >
+              <el-icon class="hist-ico"><ChatLineRound /></el-icon>
+              <span class="hist-title">{{ c.title }}</span>
+              <button class="hist-del" title="删除该对话" @click.stop="removeConversation(c.id)">
+                <el-icon><Delete /></el-icon>
+              </button>
+            </div>
+          </div>
+        </div>
 
         <div class="cap-block">
           <div class="block-title">我能帮您</div>
@@ -234,7 +343,7 @@ onMounted(loadHealth)
       <section class="main">
         <div class="main-top">
           <button class="menu-btn" @click="sidebarOpen = true">☰</button>
-          <span class="top-title">智能医疗问诊助手</span>
+          <span class="top-title">智慧问诊Agent系统</span>
         </div>
 
         <DisclaimerBanner />
@@ -336,7 +445,7 @@ onMounted(loadHealth)
   box-shadow: 0 6px 16px rgba(11, 61, 58, 0.28);
   animation: heartbeat 2.6s ease-in-out infinite; }
 @keyframes heartbeat { 0%,100%{transform:scale(1)} 14%{transform:scale(1.08)} 28%{transform:scale(1)} 42%{transform:scale(1.06)} 56%{transform:scale(1)} }
-.brand-name { font-family: var(--font-display); font-size: 21px; font-weight: 900; color: var(--teal-900); }
+.brand-name { font-family: var(--font-display); font-size: 19px; font-weight: 900; color: var(--teal-900); }
 .brand-sub { font-size: 11px; color: #5c8480; letter-spacing: 0.06em; margin-top: 2px; }
 
 .new-conv {
@@ -351,6 +460,24 @@ onMounted(loadHealth)
 
 .block-title { font-size: 12px; font-weight: 700; letter-spacing: 0.1em; color: #6b918d;
   text-transform: uppercase; margin-bottom: 10px; }
+
+/* ---------- 对话历史栏（DeepSeek 式布局，沿用绿色医疗风格） ---------- */
+.hist-block { display: flex; flex-direction: column; min-height: 0; }
+.hist-empty { font-size: 12px; color: #8aa6a2; padding: 4px 8px; }
+.hist-list { display: flex; flex-direction: column; gap: 2px;
+  overflow-y: auto; max-height: 240px; margin: -4px; padding: 4px; }
+.hist-item { position: relative; display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 10px; cursor: pointer;
+  color: #46605c; font-size: 13px; transition: background 0.15s; }
+.hist-item:hover { background: rgba(217, 242, 236, 0.6); }
+.hist-item.active { background: var(--mint); color: #0b3d3a; font-weight: 600; }
+.hist-ico { flex: none; color: #7a9894; }
+.hist-item.active .hist-ico { color: var(--teal-700); }
+.hist-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist-del { display: none; flex: none; border: none; background: transparent; cursor: pointer;
+  color: #8aa6a2; padding: 2px; border-radius: 6px; }
+.hist-del:hover { color: #b91c1c; background: rgba(185, 28, 28, 0.08); }
+.hist-item:hover .hist-del { display: grid; place-items: center; }
 
 .cap-block { display: flex; flex-direction: column; }
 .cap-item { display: flex; gap: 11px; padding: 9px 8px; border-radius: 12px;

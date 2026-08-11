@@ -71,3 +71,39 @@ class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(default=None, description="Error detail")
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+
+# ============================================================
+# Conversation History Models（对话历史管理，§6 企业方案）
+# ============================================================
+
+class ConversationItem(BaseModel):
+    """Conversation list item"""
+    id: str = Field(..., description="对话 ID（= 前端 session_id）")
+    title: str = Field(default="", description="对话标题（首问截断）")
+    created_at: str = Field(default="", description="创建时间")
+    updated_at: str = Field(default="", description="最后更新时间")
+
+
+class ConversationListResponse(BaseModel):
+    """Conversation list response"""
+    conversations: list[ConversationItem] = Field(default_factory=list, description="按 updated_at 倒序")
+
+
+class MessageItem(BaseModel):
+    """Single message of a conversation"""
+    role: str = Field(..., description="user / assistant")
+    content: str = Field(..., description="消息内容")
+    intent: str = Field(default="", description="意图类型")
+    created_at: str = Field(default="", description="写入时间")
+
+
+class ConversationDetailResponse(BaseModel):
+    """Conversation detail response"""
+    conversation_id: str = Field(..., description="对话 ID")
+    messages: list[MessageItem] = Field(default_factory=list, description="按时间正序")
+
+
+class DeleteConversationResponse(BaseModel):
+    """Delete conversation response"""
+    deleted: str = Field(..., description="被删除的对话 ID")

@@ -40,8 +40,36 @@ class Settings(BaseSettings):
         description="LLM API key (DashScope API Key)"
     )
     model_name: str = Field(
-        default="qwen-plus",
+        # default="qwen-plus",
+        default="qwen3.7-max-2026-06-08",
         description="LLM model name"
+    )
+    llm_enable_thinking: bool = Field(
+        default=False,
+        description="是否启用 qwen3 系列混合思考模型的 reasoning(思考)模式。"
+                    "本系统多数 LLM 调用为意图分类/症状抽取/科室与用药择优等结构化小任务，"
+                    "默认关闭思考可大幅降低单次延迟(常见 5-20s → 1-3s)与 token 消耗；"
+                    "如需复杂医学推理，可在 .env 设为 true。对非 qwen3 模型此参数被服务端忽略，无副作用。"
+    )
+    llm_max_retries: int = Field(
+        default=1,
+        description="LLM 调用失败重试次数。延迟敏感路径建议 ≤1，避免慢调用重试导致耗时翻倍。"
+    )
+
+    # ===== Extraction LLM Configuration（微调模型，仅用于实体/关系抽取）=====
+    # base_url 留空则抽取任务回退到主 LLM，行为与改动前完全一致
+    extraction_model_base_url: str = Field(
+        default="",
+        description="微调模型 vLLM 服务地址（如 http://192.168.122.3:8000/v1）。"
+                    "留空=不启用，实体/关系抽取仍走主 LLM"
+    )
+    extraction_model_api_key: str = Field(
+        default="EMPTY",
+        description="vLLM 服务不校验密钥，固定填 EMPTY"
+    )
+    extraction_model_name: str = Field(
+        default="qwen2.5-merged",
+        description="vLLM --served-model-name 指定的模型名"
     )
 
     # ===== Neo4j Configuration =====
@@ -64,6 +92,17 @@ class Settings(BaseSettings):
         description="Local path to BGE-M3 embedding model (relative to project root or absolute)"
     )
 
+    # ===== Conversation History Storage（Redis 热缓存 + MySQL 冷存储）=====
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis URL for session hot cache"
+    )
+    mysql_host: str = Field(default="localhost", description="MySQL host")
+    mysql_port: int = Field(default=3306, description="MySQL port")
+    mysql_user: str = Field(default="root", description="MySQL user")
+    mysql_password: str = Field(default="123456", description="MySQL password")
+    mysql_database: str = Field(default="smc_history", description="MySQL database for conversation history")
+
     # ===== Logging Configuration =====
     log_level: str = Field(
         default="INFO",
@@ -72,7 +111,7 @@ class Settings(BaseSettings):
 
     # ===== Application Configuration =====
     app_name: str = Field(
-        default="Medical Consultation Assistant",
+        default="SmartMedicalConsultation",
         description="Application name"
     )
     app_version: str = Field(

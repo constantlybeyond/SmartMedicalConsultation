@@ -40,6 +40,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langgraph.prebuilt import create_react_agent
 
 from config.settings import settings
+from src.knowledge_graph.schema import NodeType
 from src.common.llm import get_llm
 from src.common.logger import setup_logger
 from src.common.memory import format_history
@@ -121,7 +122,7 @@ class MedicalKnowledgeAgent:
     def _expand_entity(q, name: str, typ: str):
         """返回该实体的一段事实摘要文本；查无返回 None。绝不抛异常。"""
         try:
-            if typ == "Disease":
+            if typ == NodeType.DISEASE.value:
                 info = q.get_disease_full_info(name)
                 if not info:
                     return None
@@ -137,11 +138,11 @@ class MedicalKnowledgeAgent:
                     parts.append("常用药物：" + "、".join(meds))
                 return "；".join(parts)
 
-            if typ == "Symptom":
+            if typ == NodeType.SYMPTOM.value:
                 diseases = q.get_symptom_diseases(name)
                 return f"症状「{name}」可能对应的疾病：{'、'.join(diseases)}" if diseases else None
 
-            if typ in ("Medication", "Drug"):
+            if typ in (NodeType.MEDICATION.value, "Drug"):  # "Drug" 为历史别名
                 info = q.get_medication_info(name)
                 if not info:
                     return None
@@ -175,8 +176,8 @@ class MedicalKnowledgeAgent:
         """
         hits = []
         try:
-            from src.vector_store.search import VectorRetriever
-            vr = retriever or VectorRetriever()
+            from src.vector_store.search import get_shared_retriever
+            vr = retriever or get_shared_retriever()
             hits = vr.search(text, top_k=5) or []
         except Exception as e:
             logger.warning(f"[MedicalKnowledge] vector retrieval failed: {e}")
@@ -262,10 +263,11 @@ class MedicalKnowledgeAgent:
         user_text = (f"【对话历史】\n{format_history(history)}\n\n【本轮问题】\n{query}") if history else query
 
         # Step 1：强制检索（grounding 底线，必走）
+        # 复用进程级共享检索器（启动时已预热），避免每请求重读索引/重载模型
         retriever = None
         try:
-            from src.vector_store.search import VectorRetriever
-            retriever = VectorRetriever()
+            from src.vector_store.search import get_shared_retriever
+            retriever = get_shared_retriever()
         except Exception as e:
             logger.warning(f"[MedicalKnowledge] retriever init failed: {e}")
         contexts, used = self._retrieve(user_text, retriever=retriever)

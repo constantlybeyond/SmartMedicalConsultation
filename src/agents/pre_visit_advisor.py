@@ -43,7 +43,9 @@ class PreVisitAdvisorAgent:
 
     def __init__(self):
         self.llm = get_llm(temperature=0.2)
-        self.chain = self.llm.with_structured_output(PreVisitAdvice)
+        # 显式指定 function_calling：langchain-openai 1.x 默认 method="json_schema"，
+        # DashScope 兼容接口不支持该 response_format（报 400 要求 messages 含 "json"）
+        self.chain = self.llm.with_structured_output(PreVisitAdvice, method="function_calling")
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", SYSTEM_PROMPT),
             ("user", "【症状】{symptoms}\n【推荐科室】{departments}")

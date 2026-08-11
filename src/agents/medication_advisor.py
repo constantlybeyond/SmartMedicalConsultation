@@ -48,7 +48,9 @@ class MedicationAdvisorAgent:
 
     def __init__(self):
         self.llm = get_llm(temperature=0.1)
-        self.chain = self.llm.with_structured_output(MedicationAdvice)
+        # 显式指定 function_calling：langchain-openai 1.x 默认 method="json_schema"，
+        # DashScope 兼容接口不支持该 response_format（报 400 要求 messages 含 "json"）
+        self.chain = self.llm.with_structured_output(MedicationAdvice, method="function_calling")
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", SYSTEM_PROMPT),
             ("user", "【症状】{symptoms}\n【用户问题】{query}\n【对话历史】{history}")

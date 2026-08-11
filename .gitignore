@@ -69,6 +69,7 @@ data/indexes/
 logs/
 *.tmp
 *.bak
+*.bak-*
 *.swp
 .DS_Store
 Thumbs.db

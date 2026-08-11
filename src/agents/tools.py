@@ -65,8 +65,9 @@ def semantic_search(query: str) -> str:
     """对知识库做语义（向量）检索，返回最相关实体列表（名称/类型/相似度）。
     当用户表述与图谱实体名不一致、需要模糊语义匹配时使用。"""
     try:
-        from src.vector_store.search import VectorRetriever
-        vr = VectorRetriever()
+        # 进程级共享检索器（启动时已预热）：避免每次工具调用重读索引/重载模型
+        from src.vector_store.search import get_shared_retriever
+        vr = get_shared_retriever()
         hits = vr.search(query, top_k=5)
         if not hits:
             return "语义检索无相关结果"

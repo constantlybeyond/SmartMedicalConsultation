@@ -24,11 +24,14 @@ if str(PROJECT_ROOT) not in sys.path:
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from tqdm import tqdm
 
 from config.paths import DATA_PROCESSED_DIR, DATA_KG_DIR, LOGS_DIR
+from config.settings import settings
 from src.common.logger import setup_logger
-from src.extraction.disease_extractor import DiseaseExtractor
+from src.extraction.disease_extractor import DiseaseExtractor, build_cloud_extract_chain
 # R1 名字唯一主人：类型名一律取自契约枚举，禁止字符串字面量
 from src.knowledge_graph.schema import NodeType, RelationType
 
@@ -287,6 +290,8 @@ def print_statistics(entities: list, relations: list, stats: dict):
     print(f"  Total records: {stats.get('total', 0)}")
     print(f"  Success: {stats.get('success', 0)}")
     print(f"  Failed: {stats.get('failed', 0)}")
+    if stats.get("cloud_fallback"):
+        print(f"  Cloud fallback (vLLM 失败后兜底): {stats.get('cloud_fallback')}")
 
     # Entity stats by type
     entity_counter = Counter(e["type"] for e in entities)
@@ -340,80 +345,116 @@ def run_extraction(
         logger.info(f"[CHECKPOINT] Resuming from checkpoint, {processed} already processed")
 
     # Initialize extractor
-    extractor = DiseaseExtractor(temperature=0.1)
+    # temperature=0：微调模型在非零采样下更容易陷入"通用列表"失控生成；贪心解码最稳
+    extractor = DiseaseExtractor(temperature=0.0)
+
+    # vLLM 微调模型偶发失控生成（长噪声输入下烧穿 max_tokens）或畸形 JSON，
+    # 对这些样本用云端主 LLM 兜底，保证建图覆盖率；兜底次数单独计数、可观测
+    use_vllm = bool(settings.extraction_model_base_url.strip())
+    cloud_fallback_chain = build_cloud_extract_chain(temperature=0.1) if use_vllm else None
+    if use_vllm:
+        logger.info("[EXTRACT] vLLM 模式：失败样本将兜底云端主 LLM（单独计数）")
 
     # Process each disease
     checkpoint.data["stats"]["total"] = len(diseases)
 
-    for idx, disease_data in enumerate(tqdm(diseases, desc="Extracting", unit="disease")):
-        # Skip if already processed
-        if resume and checkpoint.is_processed(idx):
-            continue
+    # vLLM continuous batching 与云端 API 均天然支持并发；并行化把串行数小时压到 ~30min。
+    # checkpoint 写操作只发生在主线程（as_completed 循环内），无需加锁。
+    MAX_WORKERS = 8
 
+    def process_one(idx: int, disease_data: dict):
+        """单条疾病抽取（工作线程内执行）。返回 (entities, relations, source)"""
         disease_name = disease_data.get("name", f"disease_{idx}")
 
-        try:
-            # Build comprehensive text for LLM extraction
-            # Include all available raw text for better extraction
-            text_parts = [
-                f"疾病名称：{disease_name}",
-            ]
+        # Build comprehensive text for LLM extraction
+        text_parts = [f"疾病名称：{disease_name}"]
 
-            if disease_data.get('description'):
-                text_parts.append(f"疾病描述：{disease_data['description']}")
+        if disease_data.get('description'):
+            text_parts.append(f"疾病描述：{disease_data['description']}")
 
-            if disease_data.get('symptoms'):
-                text_parts.append(f"症状：{', '.join(disease_data['symptoms'])}")
+        if disease_data.get('symptoms'):
+            text_parts.append(f"症状：{', '.join(disease_data['symptoms'])}")
 
-            if disease_data.get('treatment'):
-                # Truncate very long treatment text to avoid token limits
-                treatment = disease_data['treatment']
-                if len(treatment) > 1500:
-                    treatment = treatment[:1500] + "..."
-                text_parts.append(f"治疗方法：{treatment}")
+        if disease_data.get('treatment'):
+            # Truncate very long treatment text to avoid token limits
+            treatment = disease_data['treatment']
+            if len(treatment) > 1500:
+                treatment = treatment[:1500] + "..."
+            text_parts.append(f"治疗方法：{treatment}")
 
-            if disease_data.get('department'):
-                text_parts.append(f"就诊科室：{disease_data['department']}")
+        if disease_data.get('department'):
+            text_parts.append(f"就诊科室：{disease_data['department']}")
 
-            if disease_data.get('medications'):
-                text_parts.append(f"常用药物：{', '.join(disease_data['medications'])}")
+        if disease_data.get('medications'):
+            text_parts.append(f"常用药物：{', '.join(disease_data['medications'])}")
 
-            text = "\n".join(text_parts)
+        text = "\n".join(text_parts)
 
-            # Use LLM extraction for better structured data
-            if use_llm:
-                logger.info(f"[EXTRACT] Using LLM for: {disease_name}")
+        # Use LLM extraction for better structured data
+        if use_llm:
+            logger.info(f"[EXTRACT] Using LLM for: {disease_name}")
+            try:
                 result = extractor.extract(text)
-            else:
-                # Fallback to dict-based extraction (for testing/offline)
-                extraction_input = {
-                    "disease": {
-                        "name": disease_name,
-                        "description": disease_data.get("description"),
-                    },
-                    "symptoms": disease_data.get("symptoms", []),
-                    "medications": disease_data.get("medications", []),
-                    "departments": [disease_data.get("department", "")] if disease_data.get("department") else [],
-                    "examinations": [],
-                    "treatments": [disease_data.get("treatment", "")] if disease_data.get("treatment") else [],
-                    "body_parts": []
-                }
-                result = extractor.extract_from_dict(extraction_input)
+                source = "vllm" if use_vllm else "cloud"
+            except Exception as llm_err:
+                if cloud_fallback_chain is None:
+                    raise
+                logger.warning(
+                    f"[EXTRACT] vLLM 抽取失败，兜底云端主 LLM: {disease_name} "
+                    f"({type(llm_err).__name__})"
+                )
+                simple_result = cloud_fallback_chain.invoke({"text": text})
+                result = extractor._convert_to_result(simple_result)
+                source = "cloud_fallback"
+        else:
+            # Fallback to dict-based extraction (for testing/offline)
+            extraction_input = {
+                "disease": {
+                    "name": disease_name,
+                    "description": disease_data.get("description"),
+                },
+                "symptoms": disease_data.get("symptoms", []),
+                "medications": disease_data.get("medications", []),
+                "departments": [disease_data.get("department", "")] if disease_data.get("department") else [],
+                "examinations": [],
+                "treatments": [disease_data.get("treatment", "")] if disease_data.get("treatment") else [],
+                "body_parts": []
+            }
+            result = extractor.extract_from_dict(extraction_input)
+            source = "dict"
 
-            # Serialize
-            entities = serialize_entities(result)
-            relations = serialize_relations(result)
+        return serialize_entities(result), serialize_relations(result), source
 
-            checkpoint.add_result(idx, entities, relations, success=True)
-            logger.debug(f"[EXTRACT] {disease_name}: {len(entities)} entities, {len(relations)} relations")
+    pending = [
+        (idx, disease_data)
+        for idx, disease_data in enumerate(diseases)
+        if not (resume and checkpoint.is_processed(idx))
+    ]
 
-        except Exception as e:
-            logger.error(f"[EXTRACT] Failed for {disease_name}: {e}")
-            checkpoint.add_result(idx, [], [], success=False)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(process_one, idx, d): idx for idx, d in pending}
+        done_count = 0
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Extracting", unit="disease"):
+            idx = futures[fut]
+            disease_name = diseases[idx].get("name", f"disease_{idx}")
+            try:
+                entities, relations, source = fut.result()
+                checkpoint.add_result(idx, entities, relations, success=True)
+                if source == "cloud_fallback":
+                    checkpoint.data["stats"]["cloud_fallback"] = (
+                        checkpoint.data["stats"].get("cloud_fallback", 0) + 1
+                    )
+                logger.debug(
+                    f"[EXTRACT] {disease_name}: {len(entities)} entities, "
+                    f"{len(relations)} relations ({source})"
+                )
+            except Exception as e:
+                logger.error(f"[EXTRACT] Failed for {disease_name}: {e}")
+                checkpoint.add_result(idx, [], [], success=False)
 
-        # Save checkpoint periodically
-        if (idx + 1) % 10 == 0:
-            checkpoint.save()
+            done_count += 1
+            if done_count % 10 == 0:
+                checkpoint.save()
 
     # Final save
     checkpoint.save()

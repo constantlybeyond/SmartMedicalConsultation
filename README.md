@@ -1,4 +1,4 @@
-# 智能医疗问诊助手（Medical Consultation Assistant）
+# 智慧问诊Agent系统（SmartMedicalConsultation）
 
 基于**医疗知识图谱（Neo4j）+ 向量检索（FAISS / BGE-M3）+ LangGraph 多 Agent**的医疗问诊问答系统。后端 FastAPI 同时托管 API 与 Vue 前端静态文件，**单进程部署**，唯一外部依赖是 Neo4j（docker-compose 提供）。
 

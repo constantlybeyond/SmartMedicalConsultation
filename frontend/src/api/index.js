@@ -11,7 +11,7 @@ const http = axios.create({
 })
 
 /**
- * 智能问诊
+ * 智慧问诊
  * @param {string} query 用户问题
  * @param {string} sessionId 会话 ID
  * @returns {Promise} 后端 ConsultationResponse：
@@ -28,6 +28,31 @@ export function consult(query, sessionId) {
  */
 export function health() {
   return http.get('/health')
+}
+
+/**
+ * 对话历史列表（按 updated_at 倒序，后端读 MySQL）
+ * @returns {Promise} { conversations: [{id, title, created_at, updated_at}] }
+ */
+export function listConversations() {
+  return http.get('/conversations')
+}
+
+/**
+ * 恢复单个对话（全部消息，时间正序）
+ * @param {string} id 对话 ID（= session_id）
+ * @returns {Promise} { conversation_id, messages: [{role, content, intent, created_at}] }
+ */
+export function getConversation(id) {
+  return http.get(`/conversations/${id}`)
+}
+
+/**
+ * 删除对话（MySQL 两表 + Redis key 同步清空）
+ * @param {string} id 对话 ID
+ */
+export function deleteConversation(id) {
+  return http.delete(`/conversations/${id}`)
 }
 
 /**

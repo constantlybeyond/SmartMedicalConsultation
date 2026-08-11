@@ -1,10 +1,10 @@
-# 智能医疗问诊助手 - 技术设计文档 (TDD)
+# 智慧问诊Agent系统 - 技术设计文档 (TDD)
 
 ## 0. 工程规范（契约与验收）
 
 > **本章定位**：本 TDD 是 AI 生成器（Claude Code）的**系统约束 + 验收清单**。本章每条规范满足两个条件：
-> ① **结构性强制**——违规在写法上就不成立（导入枚举，而非手敲字符串）；
-> ② **机器化验收**——每条规范附可执行检查，由 AI 在生成后自行运行（`python scripts/check_contracts.py`）。
+> ① **结构性约束**——违规在写法上就不成立（导入枚举，而非手敲字符串）；
+> ② **自动化验收**——每条规范附可执行检查，由 AI 在生成后自行运行（`python scripts/check_contracts.py`）。
 >
 > **学生用法**：不需要背诵规范。每条 Vibe Coding 指令开头固定写一句——
 > 「严格遵守 TDD.md 第 0 章工程规范 R1–R8，生成后运行自检，全绿才算完成」。
@@ -17,7 +17,7 @@ AI 逐模块生成代码，每个模块内部永远自洽；但同一个名字�
 
 **规范的定位**：一致性类 bug（名字 / 字段 / 维度 / 数据与代码漂移）恰恰是零基础学生完全无法调试的类别——规范的目标是让这类 bug **在诞生当天死亡**。
 
-### R1 名字唯一主人（Single Source of Truth）
+### R1 单一事实来源（Single Source of Truth）
 
 **约束**：
 
@@ -51,23 +51,23 @@ schema.py（名字契约）→ extraction/（抽取，产出契约内类型）�
 
 **契约表（本项目现行）**：
 
-| 接口 / 通道 | 字段 | 类型 | 生产方 | 前端消费位置 |
-|---|---|---|---|---|
-| POST /api/consult 请求 | query | str | 前端输入 | — |
-| | session_id | str | 前端生成 | — |
-| /api/consult 响应（也是 SSE answer 帧） | answer | str | answer_fusion | ChatMessage 正文 |
-| | intent | str | intent_classifier | 元信息意图标签 |
-| | symptoms | list[str] | symptom_detector | 症状 el-tag |
-| | departments | list[str] | department_recommender | 科室 el-tag |
-| | medications | list[dict] | medication_advisor | 药物 el-tag |
-| | disclaimers | list[str] | safety_checker（强制） | 黄色免责块 |
-| | warnings | list[str] | safety_checker | 红色急症 alert |
-| | linked_entities | list[dict] | medical_knowledge 实体链接 | 「知识定位」标签 |
-| | duration_ms | int | API 层 | 元信息耗时 |
-| SSE progress 帧 | node / label / facts | str / str / dict | routes（NODE_LABELS_ZH） | ChatMessage 进度轨迹 |
-| SSE error 帧 | message | str | routes | 前端错误提示 |
-| GET /api/health | status / neo4j_connected / vector_index_loaded / agent_system_ready | str / bool×3 | AppState | 侧栏状态灯 |
-| GET /api/stats | knowledge_graph / vector_index / api | dict×3 | 各数据源 | （预留） |
+| 接口 / 通道                             | 字段                                                                | 类型             | 生产方                     | 前端消费位置         |
+| --------------------------------------- | ------------------------------------------------------------------- | ---------------- | -------------------------- | -------------------- |
+| POST /api/consult 请求                  | query                                                               | str              | 前端输入                   | —                   |
+|                                         | session_id                                                          | str              | 前端生成                   | —                   |
+| /api/consult 响应（也是 SSE answer 帧） | answer                                                              | str              | answer_fusion              | ChatMessage 正文     |
+|                                         | intent                                                              | str              | intent_classifier          | 元信息意图标签       |
+|                                         | symptoms                                                            | list[str]        | symptom_detector           | 症状 el-tag          |
+|                                         | departments                                                         | list[str]        | department_recommender     | 科室 el-tag          |
+|                                         | medications                                                         | list[dict]       | medication_advisor         | 药物 el-tag          |
+|                                         | disclaimers                                                         | list[str]        | safety_checker（强制）     | 黄色免责块           |
+|                                         | warnings                                                            | list[str]        | safety_checker             | 红色急症 alert       |
+|                                         | linked_entities                                                     | list[dict]       | medical_knowledge 实体链接 | 「知识定位」标签     |
+|                                         | duration_ms                                                         | int              | API 层                     | 元信息耗时           |
+| SSE progress 帧                         | node / label / facts                                                | str / str / dict | routes（NODE_LABELS_ZH）   | ChatMessage 进度轨迹 |
+| SSE error 帧                            | message                                                             | str              | routes                     | 前端错误提示         |
+| GET /api/health                         | status / neo4j_connected / vector_index_loaded / agent_system_ready | str / bool×3    | AppState                   | 侧栏状态灯           |
+| GET /api/stats                          | knowledge_graph / vector_index / api                                | dict×3          | 各数据源                   | （预留）             |
 
 **验收**：
 
@@ -81,13 +81,13 @@ python scripts/check_contracts.py --r3
 
 **约束（数值契约，改动须同步本表）**：
 
-| 契约项 | 值 | 权威位置 |
-|---|---|---|
-| 嵌入模型 | BGE-M3 | `models/bge-m3`，`settings.embedding_model_path` |
-| 向量维度 | **1024** | `models/bge-m3/config.json` 的 `hidden_size`；`scripts/build_index.py` 的 `dimension` |
-| 索引类型 | IndexIVFFlat + METRIC_INNER_PRODUCT | `scripts/build_index.py`（向量必须 `normalize_embeddings=True`） |
-| entities.json 条目结构 | `{name, type, data}` | `data/indexes/entities.json`，下标与索引向量一一对应 |
-| 相似度换算 | IP→原值；L2→`1 - d/2` | `VectorRetriever._distance_to_similarity` |
+| 契约项                 | 值                                  | 权威位置                                                                                      |
+| ---------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------- |
+| 嵌入模型               | BGE-M3                              | `models/bge-m3`，`settings.embedding_model_path`                                          |
+| 向量维度               | **1024**                      | `models/bge-m3/config.json` 的 `hidden_size`；`scripts/build_index.py` 的 `dimension` |
+| 索引类型               | IndexIVFFlat + METRIC_INNER_PRODUCT | `scripts/build_index.py`（向量必须 `normalize_embeddings=True`）                          |
+| entities.json 条目结构 | `{name, type, data}`              | `data/indexes/entities.json`，下标与索引向量一一对应                                        |
+| 相似度换算             | IP→原值；L2→`1 - d/2`           | `VectorRetriever._distance_to_similarity`                                                   |
 
 **验收**：
 
@@ -132,13 +132,13 @@ python scripts/check_contracts.py --r5
 
 **统一验收器**：`scripts/check_contracts.py`（覆盖 R1 / R3 / R4 / R5），退出码 0 = 全绿。
 
-| 模块 | 生成后必跑 |
-|---|---|
-| `src/extraction/` | `check_contracts.py --r1`；抽取产物类型集合 ⊆ 枚举 |
-| `src/knowledge_graph/` | `check_contracts.py --r1 --r5` |
-| `src/vector_store/`、`scripts/build_index.py` | `check_contracts.py --r4` |
-| `src/api/`、`frontend/` | `check_contracts.py --r3` + `npm run build` |
-| 全模块完成后 | R8 黄金冒烟 |
+| 模块                                              | 生成后必跑                                            |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| `src/extraction/`                               | `check_contracts.py --r1`；抽取产物类型集合 ⊆ 枚举 |
+| `src/knowledge_graph/`                          | `check_contracts.py --r1 --r5`                      |
+| `src/vector_store/`、`scripts/build_index.py` | `check_contracts.py --r4`                           |
+| `src/api/`、`frontend/`                       | `check_contracts.py --r3` + `npm run build`       |
+| 全模块完成后                                      | R8 黄金冒烟                                           |
 
 ### R8 黄金冒烟（端到端验收）
 
@@ -201,20 +201,19 @@ flowchart TB
 
 **各 Agent 的数据访问（哪个 Agent 查哪个库、用什么机制）**：
 
-| Agent | 机制 | Neo4j | FAISS | 说明 |
-|---|---|:--:|:--:|---|
-| 意图识别 intent_classifier | 纯 LLM | — | — | 五分类（appointment / medication / knowledge / emergency / general）|
-| 症状检测 symptom_detector | 纯 LLM | — | — | 抽取症状；信息不足可置 `needs_clarification` |
-| 科室推荐 department_recommender | 确定性 LLM+图检索 | ✅ | — | Tier1 图谱（症状→疾病→科室）→ Tier2 LLM 兜底 |
-| 用药建议 medication_advisor | 确定性 LLM+图检索 | ✅ | — | 疾病→药物 |
-| 就医指导 pre_visit_advisor | 确定性 LLM+图检索 | ✅ | — | 取图谱上下文生成就医须知 |
-| 医学知识 medical_knowledge | **强制混合检索 + grounded 生成** | ✅ | ✅ | FAISS 语义召回→Neo4j 取事实；检索为空时分风险兜底 |
-| 安全检查 safety_checker | 纯规则 | — | — | 免责声明 / 急症升级（不依赖 LLM）|
-| 答案融合 answer_fusion | 纯 LLM | — | — | 汇总各 Agent 输出 + 追问话术 |
-| 通用对话 general_chat | 纯 LLM | — | — | 非医疗闲聊 |
+| Agent                           | 机制                                   | Neo4j | FAISS | 说明                                                                 |
+| ------------------------------- | -------------------------------------- | :---: | :---: | -------------------------------------------------------------------- |
+| 意图识别 intent_classifier      | 纯 LLM                                 |  —  |  —  | 五分类（appointment / medication / knowledge / emergency / general） |
+| 症状检测 symptom_detector       | 纯 LLM                                 |  —  |  —  | 抽取症状；信息不足可置`needs_clarification`                        |
+| 科室推荐 department_recommender | 确定性 LLM+图检索                      |  ✅  |  —  | Tier1 图谱（症状→疾病→科室）→ Tier2 LLM 兜底                      |
+| 用药建议 medication_advisor     | 确定性 LLM+图检索                      |  ✅  |  —  | 疾病→药物                                                           |
+| 就医指导 pre_visit_advisor      | 确定性 LLM+图检索                      |  ✅  |  —  | 取图谱上下文生成就医须知                                             |
+| 医学知识 medical_knowledge      | **强制混合检索 + grounded 生成** |  ✅  |  ✅  | FAISS 语义召回→Neo4j 取事实；检索为空时分风险兜底                   |
+| 安全检查 safety_checker         | 纯规则                                 |  —  |  —  | 免责声明 / 急症升级（不依赖 LLM）                                    |
+| 答案融合 answer_fusion          | 纯 LLM                                 |  —  |  —  | 汇总各 Agent 输出 + 追问话术                                         |
+| 通用对话 general_chat           | 纯 LLM                                 |  —  |  —  | 非医疗闲聊                                                           |
 
 > **机制选型**：检索模式固定的 Agent（科室/用药/就医指导）用**确定性 LLM+图检索**（快、省、可审计）；只有问法开放、可能多跳的**医学知识**分支用 FAISS+Neo4j **混合检索**，且检索为**强制必经**——医疗场景要求答案可溯源，不允许模型跳过检索凭空作答。
-
 
 ### 1.2 架构说明
 
@@ -720,7 +719,7 @@ class MedicalCrawler:
         if not self.robots_checker.is_allowed(url):
             logging.warning(f"[BLOCKED] robots.txt disallows: {url}")
             return None
-      
+    
         # 随机 User-Agent
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         response = self.session.get(url, headers=headers, timeout=15)
@@ -738,7 +737,7 @@ class MedicalCrawler:
         html = self._fetch(url)
         if not html:
             return None
-      
+    
         soup = BeautifulSoup(html, "html.parser")
         disease = {
             "name": soup.find("h1").get_text(strip=True),
@@ -752,9 +751,9 @@ class MedicalCrawler:
         # 解析详情页，提取各字段
         return disease
   
-    def run(self, max_diseases: int = 100, use_backup: bool = False):
+    def run(self, max_diseases: int = 500, use_backup: bool = True, use_predefined: bool = True):
         """运行爬虫"""
-        # 1. 爬取好大夫在线
+        # 1. 爬取好大夫在线（预定义 500 种常见疾病种子列表 + 列表页发现）
         # 2. 如果数据不足，爬取寻医问药（备用）
         # 3. 保存结果到 data/raw/diseases.json
         pass
@@ -789,10 +788,10 @@ class DataProcessor:
         if not input_file.exists():
             logging.error(f"Raw data file not found: {input_file}")
             return False
-      
+    
         with open(input_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-      
+    
         self.raw_data = data.get("diseases", [])
         self.stats["total_raw"] = len(self.raw_data)
         return True
@@ -801,7 +800,7 @@ class DataProcessor:
         """去除重复数据（按疾病名称）"""
         seen_names = set()
         unique_data = []
-      
+    
         for disease in self.raw_data:
             name = disease.get("name", "").strip()
             if not name or name in seen_names:
@@ -809,7 +808,7 @@ class DataProcessor:
                 continue
             seen_names.add(name)
             unique_data.append(disease)
-      
+    
         self.raw_data = unique_data
   
     def clean_text(self, text: str) -> str:
@@ -825,23 +824,23 @@ class DataProcessor:
     def generate_statistics(self) -> Dict:
         """生成数据统计"""
         from collections import Counter
-      
+    
         # 按来源统计
         source_counter = Counter(d["source"] for d in self.cleaned_data)
-      
+    
         # 统计症状
         all_symptoms = []
         for d in self.cleaned_data:
             all_symptoms.extend(d.get("symptoms", []))
         symptom_counter = Counter(all_symptoms)
-      
+    
         # 字段覆盖率
         fields = ["description", "symptoms", "department", "treatment"]
         coverage = {}
         for field in fields:
             count = sum(1 for d in self.cleaned_data if d.get(field))
             coverage[field] = f"{count}/{len(self.cleaned_data)}"
-      
+    
         return {
             "total": len(self.cleaned_data),
             "by_source": dict(source_counter),
@@ -898,8 +897,8 @@ class DataProcessor:
 **使用方法**：
 
 ```bash
-# 1. 运行爬虫
-python crawler/medical_crawler.py --max 100 --backup
+# 1. 运行爬虫（默认 --max 500，寻医问药备用源默认开启）
+python crawler/medical_crawler.py
 
 # 2. 清洗数据
 python crawler/data_processor.py
@@ -947,7 +946,7 @@ class DiseaseExtractor:
     def __init__(self):
         self.llm = get_llm()
         self.parser = PydanticOutputParser(pydantic_object=DiseaseEntity)
-      
+    
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个医学信息抽取专家。请从以下文本中提取疾病信息，并按照指定格式输出。
 
@@ -1145,7 +1144,7 @@ class GraphBuilder:
         if properties:
             set_clause = ", ".join([f"r.{k} = ${k}" for k in properties.keys()])
             query += f" ON CREATE SET {set_clause}"
-      
+    
         params = {
             "start_name": start_node,
             "end_name": end_node,
@@ -1181,7 +1180,7 @@ class VectorStore:
         # entities: [{"name": "高血压", "type": "Disease", "description": "..."}]
         texts = [f"{e['name']} {e.get('description', '')}" for e in entities]
         embeddings = embedding_model.encode(texts)
-      
+    
         # 构建 FAISS 索引
         dimension = embeddings.shape[1]
         self.index = faiss.IndexFlatL2(dimension)
@@ -1192,14 +1191,14 @@ class VectorStore:
         """语义搜索"""
         query_embedding = embedding_model.encode([query])
         distances, indices = self.index.search(np.array(query_embedding), top_k)
-      
+    
         results = []
         for idx, distance in zip(indices[0], distances[0]):
             if idx < len(self.entities):
                 entity = self.entities[idx].copy()
                 entity["score"] = float(1 / (1 + distance))  # 转换为相似度分数
                 results.append(entity)
-      
+    
         return results
   
     def save_index(self, path: str):
@@ -1284,7 +1283,7 @@ class IntentClassifierAgent:
     def __init__(self):
         self.llm = get_llm()
         self.parser = PydanticOutputParser(pydantic_object=IntentResult)
-      
+    
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个医疗问诊意图识别专家。请判断用户的意图类型：
 
@@ -1307,10 +1306,10 @@ class IntentClassifierAgent:
         )
         response = self.llm.invoke(formatted_prompt)
         result = self.parser.parse(response.content)
-      
+    
         state["intent"] = result.intent
         state["messages"].append(f"意图识别：{result.intent} (置信度: {result.confidence})")
-      
+    
         return state
 ```
 
@@ -1339,7 +1338,7 @@ class SymptomDetectorAgent:
     def __init__(self):
         self.llm = get_llm()
         self.parser = PydanticOutputParser(pydantic_object=SymptomResult)
-      
+    
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个医学症状检测专家。请从用户描述中提取症状信息：
 
@@ -1359,12 +1358,12 @@ class SymptomDetectorAgent:
         )
         response = self.llm.invoke(formatted_prompt)
         result = self.parser.parse(response.content)
-      
+    
         state["symptoms"] = result.symptoms
         state["severity"] = result.severity
         state["is_emergency"] = result.is_emergency
         state["messages"].append(f"症状检测：{result.symptoms} (严重程度: {result.severity})")
-      
+    
         return state
 ```
 
@@ -1475,7 +1474,7 @@ from src.api.routes.consultation import router as consultation_router
 from src.api.routes.health import router as health_router
 
 app = FastAPI(
-    title="智能医疗问诊助手",
+    title="智慧问诊Agent系统",
     version="1.0.0",
     description="基于知识图谱的医疗咨询系统"
 )
@@ -1556,6 +1555,7 @@ class ConsultationResponse(BaseModel):
 **技术栈**：Vue 3（Composition API + `<script setup>`）+ Element Plus + Vite + axios
 
 **目录结构**：
+
 ```
 frontend/
 ├── index.html              # 入口 HTML
@@ -1641,6 +1641,7 @@ async function send() {
 ```
 
 **部署方式**：
+
 ```bash
 cd frontend && npm run build        # 产出 dist/ 静态文件
 # FastAPI 中挂载（API 路由注册之后）：
@@ -1823,18 +1824,18 @@ messages: [..., "答案融合：完成"]
 
 ### 4.1 技术栈总览
 
-| 层级       | 技术                              | 版本     | 用途            | 选型理由                        |
-| ---------- | --------------------------------- | -------- | --------------- | ------------------------------- |
-| 网页爬虫   | requests + BeautifulSoup          | 最新     | 数据采集        | 简单易用，适合小规模爬取        |
-| 数据处理   | pandas + openpyxl                 | 最新     | Excel 读写      | 功能强大，API 友好              |
-| 大语言模型 | langchain + ChatOpenAI            | 最新     | LLM 调用        | 统一接口，支持多种 LLM          |
-| 结构化输出 | pydantic                          | v2       | 数据校验        | 类型安全，自动生成文档          |
-| 图数据库   | Neo4j                             | 5.26 LTS | 知识图谱存储    | 图数据库领导者，Cypher 语法简洁 |
-| 向量检索   | sentence-transformers + FAISS     | 最新     | 语义搜索        | BGE-M3 多语言支持，FAISS 高效   |
-| Agent 编排 | LangGraph                         | 最新     | 多 Agent 状态图 | LangChain 生态，易于扩展        |
-| Web API    | FastAPI + Uvicorn                 | 最新     | REST 接口       | 高性能，自动生成文档            |
+| 层级       | 技术                              | 版本     | 用途            | 选型理由                                    |
+| ---------- | --------------------------------- | -------- | --------------- | ------------------------------------------- |
+| 网页爬虫   | requests + BeautifulSoup          | 最新     | 数据采集        | 简单易用，适合小规模爬取                    |
+| 数据处理   | pandas + openpyxl                 | 最新     | Excel 读写      | 功能强大，API 友好                          |
+| 大语言模型 | langchain + ChatOpenAI            | 最新     | LLM 调用        | 统一接口，支持多种 LLM                      |
+| 结构化输出 | pydantic                          | v2       | 数据校验        | 类型安全，自动生成文档                      |
+| 图数据库   | Neo4j                             | 5.26 LTS | 知识图谱存储    | 图数据库领导者，Cypher 语法简洁             |
+| 向量检索   | sentence-transformers + FAISS     | 最新     | 语义搜索        | BGE-M3 多语言支持，FAISS 高效               |
+| Agent 编排 | LangGraph                         | 最新     | 多 Agent 状态图 | LangChain 生态，易于扩展                    |
+| Web API    | FastAPI + Uvicorn                 | 最新     | REST 接口       | 高性能，自动生成文档                        |
 | 前端界面   | Vue 3 + Element Plus              | 最新     | 聊天界面        | 主流工程实现，构建为静态文件由 FastAPI 托管 |
-| 环境配置   | python-dotenv + pydantic-settings | 最新     | 环境变量        | 类型安全，配置验证              |
+| 环境配置   | python-dotenv + pydantic-settings | 最新     | 环境变量        | 类型安全，配置验证                          |
 
 ### 4.2 技术选型详细说明
 
