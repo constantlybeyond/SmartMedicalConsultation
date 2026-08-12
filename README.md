@@ -141,6 +141,22 @@ make eval-e2e     # 经已启动的 API 做端到端（先启动 start_api.py）
 
 报告写入 `evals/last_report.md`。**硬规则门禁**：免责声明覆盖率 < 100% / 急症召回 < 阈值 / 意图准确率 < 阈值 → 退出码非 0。`evals/ci_github_actions.yml` 为 GitHub Actions 参考模板。
 
+## 本地 CI 门禁（pre-push）
+
+TDD 第 0 章 R7 管"AI 生成模块后立即自检"；`.githooks/pre-push` 管最后一道：**任何人 push 前自动跑契约验收（R1/R3/R4/R5），不绿则阻止推送**。
+
+```bash
+# clone 后执行一次即可启用（core.hooksPath 不随仓库传播）
+git config core.hooksPath .githooks
+
+# 可选：push 时追加评估 smoke 子集（需 MODEL_API_KEY，耗 token）
+# Windows PowerShell:  $env:PUSH_EVAL="1"; git push
+PUSH_EVAL=1 git push
+
+# 紧急绕过（不推荐）
+git push --no-verify
+```
+
 ## 相关文档
 
 - `PRD.md` 产品需求 · `TDD.md` 技术设计（含架构图与数据访问分工）

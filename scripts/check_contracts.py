@@ -225,6 +225,8 @@ def check_r3():
         from src.api.models import (
             ConsultationRequest, ConsultationResponse,
             HealthResponse, StatsResponse,
+            ConversationListResponse, ConversationDetailResponse,
+            DeleteConversationResponse,
         )
     except Exception as e:
         fail(f"无法加载 src/api/models.py：{e}")
@@ -234,7 +236,14 @@ def check_r3():
     request_fields = set(ConsultationRequest.model_fields)
     health_fields = set(HealthResponse.model_fields)
     stats_fields = set(StatsResponse.model_fields)
-    allowed = response_fields | request_fields | health_fields | stats_fields | SSE_WHITELIST
+    # 对话历史三件套（§6 企业方案）：前端 data.conversations / data.messages / data.deleted
+    history_fields = (
+        set(ConversationListResponse.model_fields)
+        | set(ConversationDetailResponse.model_fields)
+        | set(DeleteConversationResponse.model_fields)
+    )
+    allowed = (response_fields | request_fields | health_fields | stats_fields
+               | history_fields | SSE_WHITELIST)
 
     # 扫描前端对 data.<字段> 的引用
     frontend_src = PROJECT_ROOT / "frontend" / "src"

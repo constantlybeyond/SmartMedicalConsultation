@@ -1,0 +1,40 @@
+#!/bin/sh
+# ============================================================
+# 本地 CI 门禁（pre-push）—— TDD 第 0 章 R7/R8 的推送时兜底
+# ------------------------------------------------------------
+# R7 管的是"AI 生成模块后立即自检"；本 hook 管的是最后一道：
+# 无论谁（人 / AI）提交，push 到远程前必须契约验收全绿。
+#
+# 启用方式（clone 后执行一次；core.hooksPath 不随仓库传播）：
+#   git config core.hooksPath .githooks
+#
+# 环境变量：
+#   PY=python3     指定 Python 解释器（默认 python）
+#   PUSH_EVAL=1    追加评估 smoke 子集（需 MODEL_API_KEY，耗 token，默认关）
+#
+# 紧急绕过（不推荐，绕过即失去门禁意义）：
+#   git push --no-verify
+# ============================================================
+
+PY="${PY:-python}"
+
+echo "🔍 [pre-push] 本地 CI 门禁：运行契约验收（R1/R3/R4/R5）..."
+
+if ! "$PY" scripts/check_contracts.py --no-db; then
+    echo "" >&2
+    echo "❌ [pre-push] 契约验收未全绿，已阻止推送。" >&2
+    echo "   请修复后重新提交；紧急情况可 git push --no-verify 绕过（不推荐）。" >&2
+    exit 1
+fi
+
+if [ "${PUSH_EVAL:-0}" = "1" ]; then
+    echo "🔍 [pre-push] 追加运行评估 smoke 子集（evals/runner.py --subset smoke）..."
+    if ! "$PY" evals/runner.py --subset smoke; then
+        echo "" >&2
+        echo "❌ [pre-push] 评估门禁未达标（disclaimer/急症/意图硬规则），已阻止推送。" >&2
+        exit 1
+    fi
+fi
+
+echo "✅ [pre-push] 本地 CI 门禁全绿，放行推送。"
+exit 0
