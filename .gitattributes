@@ -1,0 +1,2 @@
+# 钩子脚本必须保持 LF 行尾（CRLF 会导致 sh 执行失败）
+.githooks/** text eol=lf
