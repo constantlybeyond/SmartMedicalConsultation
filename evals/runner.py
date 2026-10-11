@@ -25,7 +25,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 from evals.judge import judge_answer
-from evals.observe import trace_span
+from src.common.observe import trace_span
 
 HERE = Path(__file__).parent
 DATASET = HERE / "dataset.jsonl"
@@ -90,6 +90,31 @@ def _pred_emergency(warnings, answer):
     return bool(warnings)
 
 
+# ---------- E2E 认证（§7：/api/consult 需登录，评测用一次性专用账号） ----------
+_EVAL_AUTH = {}
+
+
+def _eval_token(base_url):
+    """获取（或惰性创建）评测专用账号的 JWT，进程内缓存复用。"""
+    if base_url in _EVAL_AUTH:
+        return _EVAL_AUTH[base_url]
+    import requests
+    b = base_url.rstrip("/")
+    username, password = "eval_bot", "EvalBot@2026"
+    r = requests.post(f"{b}/api/auth/login",
+                      data={"username": username, "password": password}, timeout=15)
+    if r.status_code != 200:
+        reg = requests.post(f"{b}/api/auth/register",
+                            json={"username": username, "password": password}, timeout=15)
+        if reg.status_code not in (201, 409):
+            raise RuntimeError(f"eval 账号注册失败: {reg.status_code} {reg.text[:120]}")
+        r = requests.post(f"{b}/api/auth/login",
+                          data={"username": username, "password": password}, timeout=15)
+        r.raise_for_status()
+    _EVAL_AUTH[base_url] = r.json()["access_token"]
+    return _EVAL_AUTH[base_url]
+
+
 # ---------- one case ----------
 def eval_case(case, base_url=None):
     gold = case["gold"]
@@ -101,7 +126,9 @@ def eval_case(case, base_url=None):
     if base_url:
         import requests
         r = requests.post(base_url.rstrip("/") + "/api/consult",
-                          json={"query": query, "session_id": f"eval-{case['id']}"}, timeout=120)
+                          json={"query": query, "session_id": f"eval-{case['id']}"},
+                          headers={"Authorization": f"Bearer {_eval_token(base_url)}"},
+                          timeout=120)
         d = r.json()
         answer = d.get("answer", "")
         intent = d.get("intent", "")
@@ -114,14 +141,18 @@ def eval_case(case, base_url=None):
         with trace_span(f"eval:{case['id']}", inputs={"query": query}) as span:
             state = run(query, history=history)
             tool_calls = _tool_calls_from_state(state)
-            span.update(tool_calls=tool_calls)
+            # update 必须在 with 内完成：flush 在退出时执行，块外 update 的元数据会丢失
+            span.update(
+                tool_calls=tool_calls,
+                intent=state.get("intent", ""),
+                latency_ms=round((time.perf_counter() - t0) * 1000),
+            )
         answer = state.get("final_answer", "")
         intent = state.get("intent", "")
         symptoms = state.get("symptoms", [])
         depts = state.get("departments", [])
         disclaimers = state.get("disclaimers", [])
         warnings = state.get("warnings", [])
-        span.update(intent=intent, latency_ms=round((time.perf_counter() - t0) * 1000))
 
     latency_ms = (time.perf_counter() - t0) * 1000
     m = {
