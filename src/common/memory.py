@@ -73,11 +73,19 @@ memory = SessionMemory()
 
 
 def format_history(turns: list[dict]) -> str:
-    """把历史轮次格式化为可放入提示词的文本"""
+    """把历史轮次格式化为可放入提示词的文本。
+
+    §6.6：支持 role="summary" 的摘要元素（由 history.load_context 注入的
+    滚动摘要），渲染为独立的【更早对话摘要】段，置于最前。
+    """
     if not turns:
         return "（无历史对话，这是首轮提问）"
     lines = []
     for t in turns:
-        who = "用户" if t.get("role") == "user" else "助手"
+        role = t.get("role")
+        if role == "summary":
+            lines.append(f"【更早对话摘要】{t.get('content', '')}")
+            continue
+        who = "用户" if role == "user" else "助手"
         lines.append(f"{who}：{t.get('content', '')}")
     return "\n".join(lines)
