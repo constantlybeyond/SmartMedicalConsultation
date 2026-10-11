@@ -11,6 +11,8 @@ langchain-openai==1.4.1
 langchain-community==0.4.2
 langchain-core==1.5.1
 langgraph==1.2.9
+# LangGraph 执行态持久化（checkpointer，见 src/agents/checkpointer.py / 讲义 day04 §3.7）
+langgraph-checkpoint-sqlite==3.1.1
 
 # ===== 向量检索 =====
 faiss-cpu==1.14.3
@@ -27,6 +29,14 @@ mysql-connector-python==9.1.0
 # ===== Web 框架 =====
 fastapi==0.139.2
 uvicorn==0.30.6
+
+# ===== 用户认证（讲义 §7：bcrypt 密码哈希 + JWT + OAuth2 表单解析）=====
+bcrypt==4.2.1
+PyJWT==2.10.1
+python-multipart==0.0.20
+
+# ===== 上下文 Token 预算（讲义 §6.6：token 计数，不可用时自动降级启发式估算）=====
+tiktoken==0.13.0
 
 # ===== 数据验证 =====
 pydantic==2.13.4

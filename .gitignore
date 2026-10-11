@@ -59,9 +59,14 @@ models/
 data/raw/
 data/processed/
 data/indexes/
+data/checkpoints/
+# data/cache/ = L2 语义缓存运行时产物，含用户问诊文本与其向量，绝不入库
+data/cache/
 *.xlsx
 *.csv
 *.json
+# *.npz = semantic_cache.npz 这类二进制数组产物，上面的 *.json 拦不住
+*.npz
 !package.json
 
 # ===== 日志和临时文件 =====

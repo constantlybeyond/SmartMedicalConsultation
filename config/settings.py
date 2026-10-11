@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     )
     model_name: str = Field(
         # default="qwen-plus",
-        default="qwen3.7-max-2026-06-08",
+        default="qwen3.7-flash",
         description="LLM model name"
     )
     llm_enable_thinking: bool = Field(
@@ -103,6 +103,74 @@ class Settings(BaseSettings):
     mysql_password: str = Field(default="123456", description="MySQL password")
     mysql_database: str = Field(default="smc_history", description="MySQL database for conversation history")
 
+    # ===== 多轮上下文 Token 预算（token 级控制：计数 + 滑窗 + 摘要，讲义 §6.6）=====
+    history_max_turns: int = Field(
+        default=12,
+        description="热缓存/上下文窗口的轮次硬上限（原有 HOT_TURNS 配置化）"
+    )
+    history_max_tokens: int = Field(
+        default=3000,
+        description="注入提示词的历史段 token 预算（保守估算）。读路径按此从最旧裁剪，"
+                    "写路径超出预算的旧轮次触发增量摘要，不再硬截断丢失"
+    )
+    history_summary_min_keep: int = Field(
+        default=4,
+        description="增量摘要时至少原文保留的最近轮次数（对话连贯性下限）"
+    )
+    history_summary_max_chars: int = Field(
+        default=600,
+        description="滚动摘要的最大字符数（提示词要求 ≤300 字，此为硬截断保险丝）"
+    )
+
+    # ===== 答案缓存（L1 精确 + L2 语义，实现见 src/common/answer_cache.py）=====
+    cache_enabled: bool = Field(
+        default=True,
+        description="答案缓存总开关。关闭后行为与无缓存完全一致（跑评估基线对比时可关）"
+    )
+    cache_version: str = Field(
+        default="v1",
+        description="缓存命名空间版本号：知识库/图谱重建后改个新值即整体失效"
+                    "（L1 key 前缀 + L2 文件版本同时作废）"
+    )
+    cache_l1_ttl_seconds: int = Field(
+        default=86400,
+        description="L1 精确缓存 TTL（秒）；版本更新才是主失效手段，TTL 只是兜底"
+    )
+    cache_similarity_threshold: float = Field(
+        default=0.92,
+        description="L2 语义缓存命中阈值（归一化余弦）。医疗场景从严：只命中近乎同义的问法，"
+                    "调低会误命中不同病症的问题"
+    )
+    cache_l2_max_entries: int = Field(
+        default=256,
+        description="L2 语义缓存容量上限，超出按最旧淘汰（FIFO）"
+    )
+
+    # ===== User Authentication（JWT 认证，讲义 §7）=====
+    jwt_secret: str = Field(
+        default="",
+        description="JWT 签名密钥（HS256）。强烈建议在 .env 配置固定随机串，例如执行 "
+                    "python -c \"import secrets;print(secrets.token_urlsafe(48))\" 生成。"
+                    "留空=每次启动随机生成，重启后所有登录态失效（仅适合开发环境）。"
+    )
+    jwt_algorithm: str = Field(default="HS256", description="JWT 签名算法")
+    access_token_expire_minutes: int = Field(
+        default=120,
+        description="访问令牌有效期（分钟）。过期后前端需重新登录"
+    )
+
+    # ===== CORS（开启认证后收紧，禁止 "*"）=====
+    cors_allowed_origins: str = Field(
+        default="http://localhost:5173,http://127.0.0.1:5173",
+        description="CORS 允许来源白名单，逗号分隔。开发=Vite :5173；"
+                    "生产单进程同源部署时前端不触发 CORS，无需添加"
+    )
+
+    @property
+    def cors_origins(self) -> list:
+        """把逗号分隔的白名单解析为列表（过滤空项）。"""
+        return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+
     # ===== Logging Configuration =====
     log_level: str = Field(
         default="INFO",
@@ -128,6 +196,21 @@ class Settings(BaseSettings):
         default=True,
         description="医学知识分支是否在『强制检索』之上再启用可选 ReAct 多跳层（tool-calling）。"
                     "强制检索是 grounding 底线、必走；ReAct 仅作多跳补充与工具调用演示。关闭则纯强制检索，更快更省。"
+    )
+
+    # ===== Agent 执行态持久化（checkpointer，实现见 src/agents/checkpointer.py）=====
+    checkpoint_enabled: bool = Field(
+        default=True,
+        description="是否为 LangGraph 挂 SqliteSaver checkpointer：图执行态（AgentState）按 "
+                    "thread_id=user_{uid}__session_{sid} 落盘，支撑中断恢复 / 状态回溯 / 「重启不丢」。"
+                    "注意它不是事实源——对话记录仍以 MySQL 为准，跨轮连续性靠短期记忆（history 注入）；"
+                    "新一轮提问会清空上一轮执行态（AgentState 的 operator.add 累加字段不清会翻倍）。"
+                    "设为 False 即回退到无 checkpointer 的老行为（thread_id 自动失效，便于对照实验）。"
+    )
+    checkpoint_db_path: str = Field(
+        default="data/checkpoints/agent_checkpoints.sqlite",
+        description="checkpoint SQLite 文件路径（相对路径按项目根解析）。运行时产物 + 含用户医疗问答内容，"
+                    "已进 .gitignore，永不提交。"
     )
 
     # ===== Entity Linking Configuration =====

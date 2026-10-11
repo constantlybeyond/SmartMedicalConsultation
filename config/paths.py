@@ -19,6 +19,7 @@ DATA_RAW_DIR = DATA_DIR / "raw"                    # Raw crawled data
 DATA_PROCESSED_DIR = DATA_DIR / "processed"        # Cleaned and processed data
 DATA_KG_DIR = DATA_DIR / "knowledge_graph"         # Knowledge graph intermediate data
 DATA_INDEXES_DIR = DATA_DIR / "indexes"            # FAISS vector indexes
+DATA_CHECKPOINTS_DIR = DATA_DIR / "checkpoints"    # LangGraph 执行态快照（可丢弃，非事实源）
 
 
 # ===== Models Directory =====
