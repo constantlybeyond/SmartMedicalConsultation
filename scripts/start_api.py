@@ -7,6 +7,7 @@
     python scripts/start_api.py --port 9000
 
 启动后访问 http://localhost:8000 即为完整应用（聊天界面 + API + /docs）。
+IPv4/IPv6 双监听：localhost 无论解析到 127.0.0.1 还是 ::1 都能秒连。
 """
 
 import sys
@@ -133,6 +134,25 @@ def main():
     print("=" * 60)
 
     import uvicorn
+
+    # IPv6 辅助监听（双栈兼容）：Windows 上 localhost 通常先解析到 ::1，
+    # 只监听 0.0.0.0（IPv4）时 ::1 连接会被系统黑洞掉，客户端白等 ~2s 超时
+    # 才回退 IPv4——表现为"缓存命中也卡 / 前端半天不出字"（2026-09-04 线上排查）。
+    # 辅助监听 lifespan="off"：启动生命周期只由主监听执行一次，避免双重初始化；
+    # 启动失败（极少数环境不支持 IPv6）不影响 IPv4 主服务。
+    if args.host == "0.0.0.0" and not args.reload:
+        import threading
+        try:
+            cfg6 = uvicorn.Config(
+                "src.api.main:app", host="::", port=args.port,
+                log_level="warning", lifespan="off",
+            )
+            threading.Thread(
+                target=uvicorn.Server(cfg6).run, name="uvicorn-ipv6", daemon=True
+            ).start()
+        except Exception as e:
+            print(f"[WARN] IPv6 辅助监听启动失败（不影响 IPv4 访问）：{e}")
+
     uvicorn.run(
         "src.api.main:app",
         host=args.host,

@@ -7,7 +7,7 @@
   ============================================================
 -->
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ChatMessage from '@/components/ChatMessage.vue'
 import DisclaimerBanner from '@/components/DisclaimerBanner.vue'
@@ -15,6 +15,12 @@ import {
   consult, consultStream, health,
   listConversations, getConversation, deleteConversation
 } from '@/api/index.js'
+
+// 已登录用户（由 App.vue 传入）；退出登录时 emit('logout') 回到登录页
+const props = defineProps({
+  user: { type: Object, default: null }
+})
+const emit = defineEmits(['logout'])
 
 // localStorage 键：记住"当前看哪个对话"（数据唯一来源是后端）
 const SESSION_KEY = 'smc_session_id'
@@ -51,6 +57,9 @@ const capabilities = [
   { icon: 'Reading', title: '医学知识', desc: '疾病科普与解读' },
   { icon: 'WarningFilled', title: '急症识别', desc: '危险信号即时预警' }
 ]
+
+// 当前用户头像字符（用户名首字符）
+const userInitial = computed(() => (props.user?.username || '?').slice(0, 1).toUpperCase())
 
 // 后端健康状态
 const healthState = ref({ checked: false, neo4j: false, vector: false, agent: false })
@@ -99,6 +108,32 @@ async function send(text) {
   sidebarOpen.value = false
   scrollBottom()
 
+  // 确保会话 ID 落盘：首轮发送时 localStorage 可能还没有该键，
+  // 不落盘会导致刷新页面后 ID 漂移、多轮上下文断裂
+  localStorage.setItem(SESSION_KEY, sessionId.value)
+
+  try {
+    await attemptSend(query, aiMsg, false)
+  } finally {
+    loading.value = false
+    scrollBottom()
+    loadConversations()  // 每轮结束后刷新历史列表的顺序与标题
+  }
+}
+
+// 404 = 当前会话属于其他用户（归属校验拒绝，不泄露存在性）
+function is404(err) {
+  return err?.status === 404 || err?.response?.status === 404
+}
+
+// 会话轮换：切账号后浏览器可能残留上一个用户的会话 ID（新账号对它必然 404），
+// 此时静默换一个新会话继续，不打断消息流（§7 归属校验的前端自愈）
+function rotateSession() {
+  sessionId.value = newId()
+  localStorage.setItem(SESSION_KEY, sessionId.value)
+}
+
+async function attemptSend(query, aiMsg, retried) {
   try {
     await consultStream(query, sessionId.value, {
       onProgress: (p) => {
@@ -114,17 +149,19 @@ async function send(text) {
       }
     })
     // 流正常结束但一帧 answer 都没收到 → 走非流式兜底
-    if (aiMsg.pending) await fallbackConsult(query, aiMsg)
+    if (aiMsg.pending) await fallbackConsult(query, aiMsg, null, retried)
   } catch (err) {
+    // 404（会话属他人，典型为切账号残留旧 ID）→ 轮换新会话重试一次
+    if (is404(err) && !retried) {
+      rotateSession()
+      aiMsg.progressSteps = []
+      return attemptSend(query, aiMsg, true)
+    }
     // SSE 连接本身失败（网络异常 / 503 / 旧后端无此端点）→ 自动降级
     if (aiMsg.pending) {
       aiMsg.progressSteps = []
-      await fallbackConsult(query, aiMsg, err)
+      await fallbackConsult(query, aiMsg, err, retried)
     }
-  } finally {
-    loading.value = false
-    scrollBottom()
-    loadConversations()  // 每轮结束后刷新历史列表的顺序与标题
   }
 }
 
@@ -140,16 +177,22 @@ function applyAnswer(aiMsg, data) {
     disclaimers: data.disclaimers || [],
     warnings: data.warnings || [],
     linked_entities: data.linked_entities || [],
-    duration_ms: data.duration_ms || 0
+    duration_ms: data.duration_ms || 0,
+    cached: !!data.cached
   })
 }
 
 // 非流式降级路径（保留原有 /consult）
-async function fallbackConsult(query, aiMsg, prevErr) {
+async function fallbackConsult(query, aiMsg, prevErr, retried) {
   try {
     const { data } = await consult(query, sessionId.value)
     applyAnswer(aiMsg, data)
   } catch (err) {
+    // 404（会话属他人）→ 轮换新会话重试一次
+    if (is404(err) && !retried) {
+      rotateSession()
+      return fallbackConsult(query, aiMsg, null, true)
+    }
     aiMsg.pending = false
     aiMsg.error = friendlyError(prevErr || err)
     ElMessage.error(aiMsg.error)
@@ -306,17 +349,6 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div class="cap-block">
-          <div class="block-title">我能帮您</div>
-          <div v-for="c in capabilities" :key="c.title" class="cap-item">
-            <span class="cap-icon"><el-icon><component :is="c.icon" /></el-icon></span>
-            <div>
-              <div class="cap-name">{{ c.title }}</div>
-              <div class="cap-desc">{{ c.desc }}</div>
-            </div>
-          </div>
-        </div>
-
         <div class="health-card">
           <div class="health-head">
             <span class="block-title" style="margin: 0">系统状态</span>
@@ -334,6 +366,17 @@ onMounted(async () => {
               <span class="health-tag" :class="r.ok ? 'ok' : 'off'">{{ r.ok ? '正常' : '离线' }}</span>
             </div>
           </template>
+        </div>
+
+        <div class="user-block">
+          <span class="user-avatar">{{ userInitial }}</span>
+          <div class="user-meta">
+            <span class="user-name" :title="props.user?.username">{{ props.user?.username || '未登录' }}</span>
+            <span class="user-sub">{{ props.user?.role === 'admin' ? '管理员' : '注册用户' }}</span>
+          </div>
+          <button class="logout-btn" title="退出登录" @click="emit('logout')">
+            <el-icon><SwitchButton /></el-icon>
+          </button>
         </div>
 
         <div class="side-foot">v1.0.0 · 仅供参考，请遵医嘱</div>
@@ -358,6 +401,15 @@ onMounted(async () => {
             <p class="empty-desc">
               描述您的症状，或询问用药、医学知识，我会为您分析并给出就医建议。
             </p>
+            <div class="cap-grid">
+              <div v-for="c in capabilities" :key="c.title" class="cap-card">
+                <span class="cap-icon"><el-icon><component :is="c.icon" /></el-icon></span>
+                <div>
+                  <div class="cap-name">{{ c.title }}</div>
+                  <div class="cap-desc">{{ c.desc }}</div>
+                </div>
+              </div>
+            </div>
             <div class="samples">
               <button
                 v-for="q in sampleQuestions"
@@ -461,11 +513,11 @@ onMounted(async () => {
 .block-title { font-size: 12px; font-weight: 700; letter-spacing: 0.1em; color: #6b918d;
   text-transform: uppercase; margin-bottom: 10px; }
 
-/* ---------- 对话历史栏（DeepSeek 式布局，沿用绿色医疗风格） ---------- */
-.hist-block { display: flex; flex-direction: column; min-height: 0; }
+/* ---------- 对话历史栏（弹性伸展占满侧栏剩余空间，不再被 240px 硬限） ---------- */
+.hist-block { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .hist-empty { font-size: 12px; color: #8aa6a2; padding: 4px 8px; }
-.hist-list { display: flex; flex-direction: column; gap: 2px;
-  overflow-y: auto; max-height: 240px; margin: -4px; padding: 4px; }
+.hist-list { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0;
+  overflow-y: auto; margin: -4px; padding: 4px; }
 .hist-item { position: relative; display: flex; align-items: center; gap: 8px;
   padding: 8px 10px; border-radius: 10px; cursor: pointer;
   color: #46605c; font-size: 13px; transition: background 0.15s; }
@@ -479,12 +531,18 @@ onMounted(async () => {
 .hist-del:hover { color: #b91c1c; background: rgba(185, 28, 28, 0.08); }
 .hist-item:hover .hist-del { display: grid; place-items: center; }
 
-.cap-block { display: flex; flex-direction: column; }
-.cap-item { display: flex; gap: 11px; padding: 9px 8px; border-radius: 12px;
-  transition: background 0.18s; }
-.cap-item:hover { background: rgba(217, 242, 236, 0.6); }
-.cap-icon { flex: none; display: grid; place-items: center; width: 34px; height: 34px;
+/* ---------- 能力卡片（移至主区欢迎页，2×2 网格；侧栏让位给对话历史） ---------- */
+.cap-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;
+  width: 100%; max-width: 560px; margin-top: 14px; }
+.cap-card { display: flex; gap: 10px; align-items: center; text-align: left;
+  padding: 10px 14px; border-radius: 14px;
+  background: rgba(255, 255, 255, 0.75); border: 1px solid rgba(15, 118, 110, 0.14);
+  transition: transform 0.18s, box-shadow 0.18s, background 0.18s; }
+.cap-card:hover { transform: translateY(-2px); background: var(--mint);
+  box-shadow: 0 6px 16px rgba(15, 118, 110, 0.14); }
+.cap-icon { flex: none; display: grid; place-items: center; width: 36px; height: 36px;
   border-radius: 10px; color: var(--teal-700); background: var(--mint); }
+.cap-card:hover .cap-icon { background: rgba(255, 255, 255, 0.85); }
 .cap-name { font-size: 14px; font-weight: 600; color: var(--ink); }
 .cap-desc { font-size: 12px; color: #7a9894; margin-top: 1px; }
 
@@ -503,6 +561,22 @@ onMounted(async () => {
 .health-tag { margin-left: auto; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; }
 .health-tag.ok { color: #2f9e44; background: rgba(47,158,68,.12); }
 .health-tag.off { color: #b08900; background: rgba(224,160,32,.16); }
+
+/* ---------- 用户信息块（§7 登录态展示） ---------- */
+.user-block { display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border-radius: 14px;
+  background: rgba(217, 242, 236, 0.45); border: 1px solid rgba(15,118,110,.12); }
+.user-avatar { flex: none; display: grid; place-items: center; width: 34px; height: 34px;
+  border-radius: 50%; color: #fff; font-size: 15px; font-weight: 700;
+  background: linear-gradient(145deg, var(--teal-500), var(--teal-700)); }
+.user-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.user-name { font-size: 13px; font-weight: 700; color: var(--teal-900);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.user-sub { font-size: 11px; color: #7a9894; }
+.logout-btn { flex: none; display: grid; place-items: center; width: 30px; height: 30px;
+  border: none; background: transparent; color: #8aa6a2; cursor: pointer;
+  border-radius: 8px; transition: background 0.15s, color 0.15s; }
+.logout-btn:hover { background: rgba(185, 28, 28, 0.08); color: #b91c1c; }
 
 .side-foot { font-size: 11px; color: #8aa6a2; text-align: center; }
 
@@ -562,5 +636,6 @@ onMounted(async () => {
     width: 30px; height: 30px; border: none; background: rgba(15,118,110,.1); border-radius: 8px;
     color: var(--teal-700); cursor: pointer; font-size: 14px; }
   .empty-title { font-size: 24px; }
+  .cap-grid { grid-template-columns: 1fr; max-width: 420px; }
 }
 </style>

@@ -152,10 +152,13 @@ const INTENT_LABEL = {
           </div>
         </div>
 
-        <!-- 元信息：耗时 + 意图 + 复制 -->
+        <!-- 元信息：耗时 + 缓存命中 + 意图 + 复制 -->
         <div class="meta">
           <span v-if="msg.duration_ms" class="meta-item">
             <el-icon><Timer /></el-icon>{{ msg.duration_ms }} ms
+          </span>
+          <span v-if="msg.cached" class="meta-chip meta-cached" title="命中答案缓存（L1 精确 / L2 语义），跳过 Agent 全链路">
+            ⚡ 缓存命中
           </span>
           <span v-if="msg.intent && INTENT_LABEL[msg.intent]" class="meta-chip">
             {{ INTENT_LABEL[msg.intent] }}
@@ -405,6 +408,11 @@ const INTENT_LABEL = {
   background: var(--mint);
   color: var(--teal-700);
   font-weight: 600;
+}
+
+.meta-cached {
+  background: #fff3d6;
+  color: #b07d10;
 }
 
 .copy-btn {

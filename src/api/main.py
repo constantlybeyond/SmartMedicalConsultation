@@ -21,7 +21,8 @@ from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
 from src.common.logger import setup_logger
-from src.api.routes import router as api_router
+from src.api.routes import router as api_router, REQUEST_TIMEOUT
+from src.api.auth_routes import router as auth_router
 
 logger = setup_logger(__name__, "api.log")
 
@@ -42,6 +43,10 @@ class AppState:
 
 app_state = AppState()
 
+# 并发上限的唯一定义处（R1）：lifespan 的 Semaphore、启动日志、__main__ banner 三处共用，
+# 不再各写一份字面量——历史上 banner 写死 30s 超时，而 routes.REQUEST_TIMEOUT 早已是 60s。
+MAX_CONCURRENCY = 5
+
 
 # ============================================================
 # Lifespan (Startup/Shutdown Events)
@@ -52,9 +57,9 @@ async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events"""
     logger.info("[API] Starting SmartMedicalConsultation API...")
 
-    # Initialize semaphore for concurrency control (max 5 concurrent requests)
-    app_state.request_semaphore = asyncio.Semaphore(5)
-    logger.info("[API] Concurrency limit: 5 requests")
+    # Initialize semaphore for concurrency control (max MAX_CONCURRENCY concurrent requests)
+    app_state.request_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    logger.info(f"[API] Concurrency limit: {MAX_CONCURRENCY} requests")
 
     # 1. Initialize Agent system
     try:
@@ -122,20 +127,20 @@ app = FastAPI(
 # CORS middleware
 # 开发模式（前端 :5173 跨域调 :8000）需要 CORS；
 # 生产单进程部署时前端与 API 同源（都是 :8000），浏览器不触发 CORS。
+# ⚠️ 安全：开启用户认证后不再允许 "*"（通配 + credentials 是浏览器拒绝的非法组合，
+# 且会让任意站点携带用户 token 跨域调用本服务）。只放行明确的来源白名单，
+# 可通过 .env 的 CORS_ALLOWED_ORIGINS（逗号分隔）扩展。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite 开发服务器
-        "http://127.0.0.1:5173",
-        "*"                       # 开发期放宽
-    ],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# Register API routes
+# Register API routes（认证路由与业务路由分挂，均位于 /api 前缀下）
+app.include_router(auth_router, prefix="/api")
 app.include_router(api_router, prefix="/api")
 
 
@@ -222,8 +227,8 @@ if __name__ == "__main__":
     print(f"  Host: 0.0.0.0")
     print(f"  Port: {settings.api_port}")
     print(f"  Docs: http://localhost:{settings.api_port}/docs")
-    print(f"  Concurrency Limit: 5")
-    print(f"  Request Timeout: 30s")
+    print(f"  Concurrency Limit: {MAX_CONCURRENCY}")
+    print(f"  Request Timeout: {REQUEST_TIMEOUT}s")   # 取自 routes.REQUEST_TIMEOUT，别再硬写
     print("=" * 60)
 
     uvicorn.run(

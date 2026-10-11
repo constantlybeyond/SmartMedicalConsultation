@@ -15,11 +15,22 @@ _project_root = Path(__file__).parent.parent.parent.resolve()
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from fastapi import APIRouter, HTTPException, Request
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from src.common.observe import trace_span, get_callbacks
+from src.common import answer_cache
+
+from src.auth.deps import User, get_current_user
+from src.agents.checkpointer import build_thread_id
 from src.common.logger import setup_logger
-from src.history.store import history_store
+from src.history.store import (
+    ConversationNotFoundError,
+    ConversationOwnershipError,
+    history_store,
+)
 from src.api.models import (
     ConsultationRequest,
     ConsultationResponse,
@@ -77,15 +88,16 @@ def log_request(
     },
     tags=["问诊"],
     summary="智慧问诊接口",
-    description="接收用户问题，返回 AI 生成的医疗建议（30秒超时，5并发限制）"
+    description="接收用户问题，返回 AI 生成的医疗建议（需登录；60秒超时，5并发限制）"
 )
-async def consult(req: ConsultationRequest):
+async def consult(req: ConsultationRequest, current_user: User = Depends(get_current_user)):
     """
     Process user consultation request
 
     - Accepts user question
     - Runs through Agent system with timeout and concurrency control
     - Returns medical advice with disclaimers
+    - Requires login; conversation is bound to the current user
     """
     from src.api.main import app_state
 
@@ -98,23 +110,83 @@ async def consult(req: ConsultationRequest):
 
     start_time = time.time()
     app_state.total_requests += 1
+    request_id = uuid.uuid4().hex[:8]
 
-    logger.info(f"[API] Consultation request: '{req.query[:50]}...' (session: {req.session_id})")
+    logger.info(
+        f"[API] Consultation request: '{req.query[:50]}...' "
+        f"(session: {req.session_id}, user: {current_user.username}, rid: {request_id})"
+    )
+
+    # 生产 tracing：callbacks 透传 LangGraph（Langfuse 模式补内层调用树；
+    # LangSmith 模式靠 env 自动 trace，返回空列表）；env 未配置时整体 no-op 零开销
+    callbacks = get_callbacks()
 
     try:
+      # 请求级 span：异常穿越 with 时也会 flush（trace_span 内部 try/finally）
+      with trace_span(
+          "consult", request_id=request_id, session_id=req.session_id,
+          user_id=current_user.id, query=req.query[:200],
+      ) as span:
         # Acquire semaphore for concurrency control
         async with app_state.request_semaphore:
             # Call Agent system with timeout
             from src.agents.graph import run
 
-            # 加载多轮上下文（三级命中：Redis 热缓存 → MySQL 回填）
-            history = history_store.load_context(req.session_id)
+            # 加载多轮上下文（先归属裁决，再三级命中：Redis 热缓存 → MySQL 回填）
+            try:
+                history = history_store.load_context(req.session_id, current_user.id)
+            except ConversationOwnershipError:
+                # 越权访问他人会话：统一 404，不泄露会话存在性
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
+            # 答案缓存（三分域，全用户隔离），命中即直返（跳过 Agent 全链路）：
+            # Cacheability Rule 按域路由——上下文依赖追问走 L1 会话域
+            # （su:{user}:{session}，同会话内复用）；自包含问题走 L1 用户精确
+            # → L2 用户语义（同一用户跨会话共享）。所有键含 user_id，绝不跨用户
+            cache_hit = answer_cache.lookup(
+                req.query, user_id=current_user.id, session_id=req.session_id
+            )
+            if cache_hit:
+                level, payload = cache_hit
+                duration_ms = int((time.time() - start_time) * 1000)
+                response = ConsultationResponse.model_validate({
+                    **payload,
+                    "cached": True,
+                    "duration_ms": duration_ms,
+                    "timestamp": datetime.now().isoformat(),
+                })
+                log_request(
+                    query=req.query,
+                    intent=response.intent,
+                    duration_ms=duration_ms,
+                    has_disclaimer=len(response.disclaimers) > 0,
+                    success=True
+                )
+                logger.info(f"[API] Answer cache hit {level} (rid: {request_id})")
+                # 命中也要落对话历史，否则下一轮上下文断裂
+                try:
+                    history_store.persist_turn(
+                        req.session_id, "user", req.query, user_id=current_user.id
+                    )
+                    history_store.persist_turn(
+                        req.session_id, "assistant", response.answer,
+                        intent=response.intent, user_id=current_user.id
+                    )
+                except (ConversationNotFoundError, ConversationOwnershipError) as e:
+                    logger.warning(f"[API] Skip persist due to ownership conflict: {e}")
+                span.update(
+                    intent=response.intent, duration_ms=duration_ms,
+                    cache=level, ok=True,
+                )
+                return response
 
             try:
                 # Run in thread pool to not block event loop
+                # thread_id 含 user_id：执行态按用户隔离（契约见 src/agents/checkpointer.py）
                 result = await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
-                        None, run, req.query, history
+                        None, run, req.query, history, callbacks,
+                        build_thread_id(current_user.id, req.session_id),
                     ),
                     timeout=REQUEST_TIMEOUT
                 )
@@ -144,12 +216,30 @@ async def consult(req: ConsultationRequest):
                     success=True
                 )
 
-                # 双写对话历史（先 MySQL 再 Redis；任一失败降级，不使请求失败）
-                history_store.persist_turn(req.session_id, "user", req.query)
-                history_store.persist_turn(
-                    req.session_id, "assistant", response.answer, intent=response.intent
+                # 双写对话历史（先 MySQL 再 Redis；任一失败降级，不使请求失败）。
+                # 首条消息落库时惰性创建会话并绑定当前用户（归属冲突仅记日志降级）。
+                try:
+                    history_store.persist_turn(
+                        req.session_id, "user", req.query, user_id=current_user.id
+                    )
+                    history_store.persist_turn(
+                        req.session_id, "assistant", response.answer,
+                        intent=response.intent, user_id=current_user.id
+                    )
+                except (ConversationNotFoundError, ConversationOwnershipError) as e:
+                    logger.warning(f"[API] Skip persist due to ownership conflict: {e}")
+
+                # 写缓存（后台线程异步，不占请求延迟）：
+                # store_async 内按 Cacheability Rule 分域——追问写会话域，自包含写用户域
+                answer_cache.store_async(
+                    req.query, response.model_dump(),
+                    user_id=current_user.id, session_id=req.session_id,
                 )
 
+                span.update(
+                    intent=response.intent, duration_ms=duration_ms,
+                    n_disclaimers=len(disclaimers), ok=True,
+                )
                 return response
 
             except asyncio.TimeoutError:
@@ -164,6 +254,7 @@ async def consult(req: ConsultationRequest):
                     success=False
                 )
 
+                span.update(intent="timeout", duration_ms=duration_ms, ok=False)
                 raise HTTPException(
                     status_code=504,
                     detail=f"Request timeout after {REQUEST_TIMEOUT}s. Please try a simpler question."
@@ -186,9 +277,14 @@ async def consult(req: ConsultationRequest):
         logger.error(f"[API] Consultation failed: {e}")
 
         err_answer = "抱歉，系统暂时无法处理您的请求。请稍后重试，或拨打医疗咨询热线 12320。"
-        # 记录本轮，避免上下文断裂
-        history_store.persist_turn(req.session_id, "user", req.query)
-        history_store.persist_turn(req.session_id, "assistant", err_answer, intent="error")
+        # 记录本轮，避免上下文断裂（归属冲突时静默跳过，不影响错误响应）
+        try:
+            history_store.persist_turn(req.session_id, "user", req.query, user_id=current_user.id)
+            history_store.persist_turn(
+                req.session_id, "assistant", err_answer, intent="error", user_id=current_user.id
+            )
+        except (ConversationNotFoundError, ConversationOwnershipError):
+            pass
 
         # Return friendly error
         return ConsultationResponse(
@@ -255,9 +351,13 @@ def _build_response_from_state(state: dict, start_time: float) -> ConsultationRe
     summary="流式问诊接口（SSE）",
     description="与 /consult 相同的结果，但以 Server-Sent Events 流式推送："
                 "event: progress（每个 Agent 节点完成的进度）→ event: answer（完整响应 JSON）"
-                "→ event: done（[DONE] 结束标记）。客户端断开时提前终止。"
+                "→ event: done（[DONE] 结束标记）。客户端断开时提前终止。需登录。"
 )
-async def consult_stream(req: ConsultationRequest, request: Request):
+async def consult_stream(
+    req: ConsultationRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """SSE 流式问诊。
 
     桥接设计：LangGraph app.stream 是同步生成器，本端点是 async def。
@@ -272,78 +372,163 @@ async def consult_stream(req: ConsultationRequest, request: Request):
             detail="Agent system not ready. Please try again later."
         )
 
+    # 归属裁决 + 上下文加载放在流开始之前：越权访问直接 404，
+    # 避免 StreamingResponse 已经发出后再也无法返回 HTTP 状态码。
+    try:
+        history = history_store.load_context(req.session_id, current_user.id)
+    except ConversationOwnershipError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
     start_time = time.time()
     app_state.total_requests += 1
-    logger.info(f"[API] Streaming consultation request: '{req.query[:50]}...' (session: {req.session_id})")
+    request_id = uuid.uuid4().hex[:8]
+    logger.info(
+        f"[API] Streaming consultation request: '{req.query[:50]}...' "
+        f"(session: {req.session_id}, user: {current_user.username}, rid: {request_id})"
+    )
+    callbacks = get_callbacks()
+
+    # 答案缓存：与 /consult 同规则（三分域，全用户隔离；Cacheability Rule 分域）。
+    # 命中时流里发一个缓存命中 progress 帧 + 完整 answer 帧，前端渲染零改动
+    cache_hit = answer_cache.lookup(
+        req.query, user_id=current_user.id, session_id=req.session_id
+    )
 
     async def event_generator():
         from src.agents.graph import run_stream, NODE_LABELS_ZH
 
         final_state = None
-        try:
-            async with app_state.request_semaphore:
-                history = history_store.load_context(req.session_id)
-                gen = run_stream(req.query, history)
-                while True:
-                    # 先查客户端断开，再取下一块
-                    if await request.is_disconnected():
-                        logger.info("[API] Stream client disconnected, stopping early")
-                        return
+        # 请求级 span：生成器结束（含异常/客户端断开提前 return）时 flush
+        with trace_span(
+            "consult_stream", request_id=request_id, session_id=req.session_id,
+            user_id=current_user.id, query=req.query[:200],
+        ) as span:
+            try:
+                if cache_hit:
+                    level, payload = cache_hit
+                    response = ConsultationResponse.model_validate({
+                        **payload,
+                        "cached": True,
+                        "duration_ms": int((time.time() - start_time) * 1000),
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    log_request(
+                        query=req.query,
+                        intent=response.intent,
+                        duration_ms=response.duration_ms,
+                        has_disclaimer=len(response.disclaimers) > 0,
+                        success=True,
+                    )
+                    logger.info(f"[API] Stream answer cache hit {level} (rid: {request_id})")
+                    # 命中也要落对话历史，否则下一轮上下文断裂
                     try:
-                        chunk = await asyncio.wait_for(
-                            asyncio.to_thread(lambda: next(gen, _STREAM_DONE)),
-                            timeout=REQUEST_TIMEOUT,
+                        history_store.persist_turn(
+                            req.session_id, "user", req.query, user_id=current_user.id
                         )
-                    except asyncio.TimeoutError:
-                        app_state.total_errors += 1
-                        logger.error(f"[API] Stream timeout after {REQUEST_TIMEOUT}s")
-                        yield _sse_format(
-                            json.dumps({"message": f"处理超时（{REQUEST_TIMEOUT}s），请简化问题后重试"},
-                                       ensure_ascii=False),
-                            event="error",
+                        history_store.persist_turn(
+                            req.session_id, "assistant", response.answer,
+                            intent=response.intent, user_id=current_user.id
                         )
-                        return
-                    if chunk is _STREAM_DONE:
-                        break
+                    except (ConversationNotFoundError, ConversationOwnershipError) as e:
+                        logger.warning(f"[API] Skip stream persist due to ownership conflict: {e}")
+                    span.update(
+                        intent=response.intent, duration_ms=response.duration_ms,
+                        cache=level, ok=True,
+                    )
+                    yield _sse_format(
+                        json.dumps(
+                            {"node": "answer_cache", "label": f"缓存命中（{level}）", "facts": {}},
+                            ensure_ascii=False,
+                        ),
+                        event="progress",
+                    )
+                    yield _sse_format(response.model_dump_json(), event="answer")
+                    yield _sse_format("[DONE]", event="done")
+                    return
 
-                    kind = chunk[0]
-                    if kind == "progress":
-                        _, node_name, delta = chunk
-                        payload = {
-                            "node": node_name,
-                            "label": NODE_LABELS_ZH.get(node_name, node_name),
-                            "facts": _facts_from_delta(delta),
-                        }
-                        yield _sse_format(json.dumps(payload, ensure_ascii=False), event="progress")
-                    else:  # kind == "values"：完整快照，最后一个即终态
-                        final_state = chunk[1]
-        except Exception as e:
-            app_state.total_errors += 1
-            logger.error(f"[API] Streaming consultation failed: {e}")
-            yield _sse_format(
-                json.dumps({"message": f"系统错误：{e}"}, ensure_ascii=False),
-                event="error",
-            )
-            return
+                async with app_state.request_semaphore:
+                    # thread_id 含 user_id：与非流式 /consult 同口径的用户级执行态隔离
+                    gen = run_stream(
+                        req.query, history, callbacks,
+                        build_thread_id(current_user.id, req.session_id),
+                    )
+                    while True:
+                        # 先查客户端断开，再取下一块
+                        if await request.is_disconnected():
+                            logger.info("[API] Stream client disconnected, stopping early")
+                            return
+                        try:
+                            chunk = await asyncio.wait_for(
+                                asyncio.to_thread(lambda: next(gen, _STREAM_DONE)),
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            app_state.total_errors += 1
+                            logger.error(f"[API] Stream timeout after {REQUEST_TIMEOUT}s")
+                            span.update(intent="timeout", ok=False)
+                            yield _sse_format(
+                                json.dumps({"message": f"处理超时（{REQUEST_TIMEOUT}s），请简化问题后重试"},
+                                           ensure_ascii=False),
+                                event="error",
+                            )
+                            return
+                        if chunk is _STREAM_DONE:
+                            break
 
-        # 终答帧：与 /consult 同口径的完整响应
-        if final_state is not None:
-            response = _build_response_from_state(final_state, start_time)
-            log_request(
-                query=req.query,
-                intent=response.intent,
-                duration_ms=response.duration_ms,
-                has_disclaimer=len(response.disclaimers) > 0,
-                success=True,
-            )
-            # 双写对话历史（与 /consult 一致）
-            history_store.persist_turn(req.session_id, "user", req.query)
-            history_store.persist_turn(
-                req.session_id, "assistant", response.answer, intent=response.intent
-            )
-            yield _sse_format(response.model_dump_json(), event="answer")
+                        kind = chunk[0]
+                        if kind == "progress":
+                            _, node_name, delta = chunk
+                            payload = {
+                                "node": node_name,
+                                "label": NODE_LABELS_ZH.get(node_name, node_name),
+                                "facts": _facts_from_delta(delta),
+                            }
+                            yield _sse_format(json.dumps(payload, ensure_ascii=False), event="progress")
+                        else:  # kind == "values"：完整快照，最后一个即终态
+                            final_state = chunk[1]
+            except Exception as e:
+                app_state.total_errors += 1
+                logger.error(f"[API] Streaming consultation failed: {e}")
+                span.update(ok=False, error=str(e)[:200])
+                yield _sse_format(
+                    json.dumps({"message": f"系统错误：{e}"}, ensure_ascii=False),
+                    event="error",
+                )
+                return
 
-        yield _sse_format("[DONE]", event="done")
+            # 终答帧：与 /consult 同口径的完整响应
+            if final_state is not None:
+                response = _build_response_from_state(final_state, start_time)
+                log_request(
+                    query=req.query,
+                    intent=response.intent,
+                    duration_ms=response.duration_ms,
+                    has_disclaimer=len(response.disclaimers) > 0,
+                    success=True,
+                )
+                # 双写对话历史（与 /consult 一致；归属冲突仅记日志，不打断流）
+                try:
+                    history_store.persist_turn(
+                        req.session_id, "user", req.query, user_id=current_user.id
+                    )
+                    history_store.persist_turn(
+                        req.session_id, "assistant", response.answer,
+                        intent=response.intent, user_id=current_user.id
+                    )
+                except (ConversationNotFoundError, ConversationOwnershipError) as e:
+                    logger.warning(f"[API] Skip stream persist due to ownership conflict: {e}")
+                # 写缓存（后台线程异步，不占流路径延迟）：按 Cacheability Rule 分域写入
+                answer_cache.store_async(
+                    req.query, response.model_dump(),
+                    user_id=current_user.id, session_id=req.session_id,
+                )
+                span.update(
+                    intent=response.intent, duration_ms=response.duration_ms,
+                    n_disclaimers=len(response.disclaimers), ok=True,
+                )
+                yield _sse_format(response.model_dump_json(), event="answer")
+
+            yield _sse_format("[DONE]", event="done")
 
     return StreamingResponse(
         event_generator(),
@@ -467,9 +652,11 @@ async def stats():
 
 
 # ============================================================
-# 对话历史管理（Redis 热缓存 + MySQL 冷存储，讲义 §6）
+# 对话历史管理（Redis 热缓存 + MySQL 冷存储 + 用户归属，讲义 §6 / §7）
 # 历史接口用 def 同步路由：FastAPI 自动放入线程池，匹配
 # store 层"MySQL 每请求新开连接、用完即关"的连接管理约定。
+# 归属原则：只返回/操作当前登录用户自己的会话；越权访问统一 404，
+# 不泄露会话是否存在（防 session_id 猜测枚举）。
 # ============================================================
 
 @router.get(
@@ -477,12 +664,14 @@ async def stats():
     response_model=ConversationListResponse,
     tags=["对话历史"],
     summary="对话历史列表",
-    description="按 updated_at 倒序分页列出对话（LIMIT ≤ 200），读 MySQL"
+    description="按 updated_at 倒序分页列出【当前用户】的对话（LIMIT ≤ 200），读 MySQL"
 )
-def list_conversations(limit: int = 50):
-    """对话历史列表（左侧历史栏数据源）"""
+def list_conversations(limit: int = 50, current_user: User = Depends(get_current_user)):
+    """对话历史列表（左侧历史栏数据源，仅本人会话）"""
     return ConversationListResponse(
-        conversations=history_store.list_conversations(limit=min(max(limit, 1), 200))
+        conversations=history_store.list_conversations(
+            current_user.id, limit=min(max(limit, 1), 200)
+        )
     )
 
 
@@ -491,15 +680,17 @@ def list_conversations(limit: int = 50):
     response_model=ConversationDetailResponse,
     tags=["对话历史"],
     summary="恢复单个对话",
-    description="返回该对话全部消息（时间正序），读 MySQL"
+    description="返回该对话全部消息（时间正序），仅限属主；读 MySQL"
 )
-def get_conversation(conversation_id: str):
-    """恢复单个对话（单击历史栏项时调用）"""
-    if not history_store.conversation_exists(conversation_id):
+def get_conversation(conversation_id: str, current_user: User = Depends(get_current_user)):
+    """恢复单个对话（单击历史栏项时调用，仅属主可访问）"""
+    try:
+        messages = history_store.get_messages(conversation_id, current_user.id)
+    except (ConversationNotFoundError, ConversationOwnershipError):
         raise HTTPException(status_code=404, detail="Conversation not found")
     return ConversationDetailResponse(
         conversation_id=conversation_id,
-        messages=history_store.get_messages(conversation_id),
+        messages=messages,
     )
 
 
@@ -508,9 +699,12 @@ def get_conversation(conversation_id: str):
     response_model=DeleteConversationResponse,
     tags=["对话历史"],
     summary="删除对话",
-    description="同步清空 MySQL 两表 + 对应 Redis key"
+    description="同步清空 MySQL 两表 + 对应 Redis key，仅限属主"
 )
-def delete_conversation(conversation_id: str):
-    """删除对话（MySQL 与 Redis 同步清空）"""
-    history_store.delete_conversation(conversation_id)
+def delete_conversation(conversation_id: str, current_user: User = Depends(get_current_user)):
+    """删除对话（仅属主可删；MySQL 与 Redis 同步清空）"""
+    try:
+        history_store.delete_conversation(conversation_id, current_user.id)
+    except (ConversationNotFoundError, ConversationOwnershipError):
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return DeleteConversationResponse(deleted=conversation_id)

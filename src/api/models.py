@@ -9,6 +9,42 @@ from datetime import datetime
 
 
 # ============================================================
+# Auth Models（用户认证，讲义 §7）
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    """注册请求：用户名 + 密码（服务端只做 bcrypt 哈希，绝不存明文）"""
+    username: str = Field(
+        ...,
+        min_length=3,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9_一-龥]+$",
+        description="用户名：3-32 位字母 / 数字 / 下划线 / 中文"
+    )
+    password: str = Field(
+        ...,
+        min_length=8,
+        max_length=64,
+        description="密码：8-64 位（建议字母+数字混合）"
+    )
+
+
+class UserOut(BaseModel):
+    """对外用户信息（不含 password_hash 等敏感字段）"""
+    id: str = Field(..., description="用户 ID")
+    username: str = Field(..., description="用户名")
+    role: str = Field(default="user", description="角色：user / admin")
+
+
+class TokenResponse(BaseModel):
+    """登录响应：JWT 访问令牌 + 用户信息"""
+    access_token: str = Field(..., description="JWT，请求头 Authorization: Bearer <token> 携带")
+    token_type: str = Field(default="bearer")
+    expires_in: int = Field(..., description="有效期（秒）")
+    user: UserOut = Field(..., description="当前用户")
+
+
+# ============================================================
 # Request Models
 # ============================================================
 
@@ -45,6 +81,10 @@ class ConsultationResponse(BaseModel):
                     "[{input_entity, matched_entity, type, similarity}]"
     )
     duration_ms: int = Field(default=0, description="Processing time in milliseconds")
+    cached: bool = Field(
+        default=False,
+        description="是否命中答案缓存（L1 精确 / L2 语义）；命中时跳过 Agent 全链路直返"
+    )
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 

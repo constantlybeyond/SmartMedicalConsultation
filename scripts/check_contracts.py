@@ -160,7 +160,7 @@ def check_r1():
         "ENABLE_REACT_LAYER", "ENTITY_LINK_THRESHOLD", "ENTITY_LINK_TOP_K",
         "TEXT2CYPHER_ENABLED", "TEXT2CYPHER_MAX_RECORDS",
         "JIMENG_AK", "JIMENG_SK",
-        # 可观测 SDK 环境变量（evals/observe.py）
+        # 可观测 SDK 环境变量（src/common/observe.py）
         "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST",
         "LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT",
         # 模块再导出清单（__all__ 中的契约对象名）
@@ -227,6 +227,7 @@ def check_r3():
             HealthResponse, StatsResponse,
             ConversationListResponse, ConversationDetailResponse,
             DeleteConversationResponse,
+            TokenResponse, UserOut,
         )
     except Exception as e:
         fail(f"无法加载 src/api/models.py：{e}")
@@ -242,8 +243,10 @@ def check_r3():
         | set(ConversationDetailResponse.model_fields)
         | set(DeleteConversationResponse.model_fields)
     )
+    # 用户认证三件套（§7）：前端 data.access_token / data.expires_in / data.user
+    auth_fields = set(TokenResponse.model_fields) | set(UserOut.model_fields)
     allowed = (response_fields | request_fields | health_fields | stats_fields
-               | history_fields | SSE_WHITELIST)
+               | history_fields | auth_fields | SSE_WHITELIST)
 
     # 扫描前端对 data.<字段> 的引用
     frontend_src = PROJECT_ROOT / "frontend" / "src"
