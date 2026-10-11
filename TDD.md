@@ -1,5 +1,19 @@
 # 智慧问诊Agent系统 - 技术设计文档 (TDD)
 
+> **文档状态与版本演进（阅读前必看）**
+>
+> 本项目按 Vibe Coding 工作流持续演进，文档保留各阶段设计痕迹。三个版本边界：
+>
+> | 版本 | 关键变化                                                                        | 当前契约位置（单一事实来源，R1）                        |
+> | ---- | ------------------------------------------------------------------------------- | ------------------------------------------------------- |
+> | V1   | 匿名 + 内存会话；请求体带`user_id`/`data` 包装                              | 已废弃，仅具历史讲解价值                                |
+> | V2   | 对话持久化（Redis 热 + MySQL 冷）；**用户认证**（JWT + bcrypt）与会话归属 | `src/api/auth_routes.py`、`src/history/store.py`    |
+> | V3   | **上下文 token 预算** + 后台增量摘要（水位机制）                          | `src/common/tokens.py`、`src/history/summarizer.py` |
+>
+> 凡本文早期示例（如 `user_id` 字段、`POST /process` 路由、`data` 包装请求体）与当前代码冲突时，
+> **一律以当前代码为准**；当前 HTTP 契约见 `src/api/routes.py` 与 `src/api/models.py`，
+> 教学讲解见 day05 讲义 §6（历史）/ §6.6（上下文预算）/ §7（认证）。
+
 ## 0. 工程规范（契约与验收）
 
 > **本章定位**：本 TDD 是 AI 生成器（Claude Code）的**系统约束 + 验收清单**。本章每条规范满足两个条件：
@@ -277,132 +291,186 @@ docker run -d --name neo4j \
 
 ### 2.1 项目结构
 
+> **本节与代码同构**（2026-10-11 用 `git ls-files` + `find` 逐文件核对）。标注约定：
+> **[入库]** = git 跟踪；**[产物]** = 运行生成、已被 `.gitignore` 排除。
+> 注意 `.gitignore` 里有一条 blanket `*.json`，**所以 `data/` 与 `models/` 下所有 JSON 都不入库**——
+> "仓库已附带中间数据"这个说法只对本地工作区成立，克隆后必须自己跑 §3 的离线流水线重建。
+> 改结构时这一节要同步改：它是 R2「契约先行」与 R5「数据即产物」的落点之一。
+
 ```
-medical-consultation-assistant/
-├── README.md                          # 项目说明
-├── PRD.md                             # 产品需求文档
-├── TDD.md                             # 技术设计文档
-├── .env                               # 环境变量配置
-├── .gitignore                         # Git 忽略文件
-├── requirements.txt                   # Python 依赖
+SmartMedicalConsultation/
+├── README.md                          # [入库] 项目说明（快速开始 / API 表 / 门禁用法）
+├── PRD.md                             # [入库] 产品需求文档
+├── TDD.md                             # [入库] 技术设计文档（第 0 章 = 工程规范 R1–R8）
+├── requirements.txt                   # [入库] 依赖清单，锁死小版本号（LangChain/LangGraph 1.x）
+├── Makefile                           # [入库] eval-fast / eval-full / eval-e2e
+├── docker-compose.yml                 # [入库] Neo4j 5.26 + Redis(AOF) + MySQL 8.0 三件套
+├── validate_env.py                    # [入库] 环境验证（6 项检查；退出码 0=全绿 / 1=有失败 / 2=多数失败）
+├── .env                               # [产物] 真实密钥，严禁提交
+├── .env.example                       # [入库] 唯一入库的配置模板（占位值 + 每个字段的注释）
+├── .gitignore / .gitattributes        # [入库] .gitattributes 强制 .githooks/** 用 LF
+├── .githooks/
+│   └── pre-push                       # [入库] 推送前自动跑契约验收（需执行一次 git config core.hooksPath .githooks）
 │
-├── config/                            # 配置文件
+├── config/                            # 配置层：所有模块的地基
 │   ├── __init__.py
-│   ├── settings.py                    # 全局配置（从 .env 读取）
-│   └── paths.py                       # 路径配置（项目目录结构）
+│   ├── settings.py                    # pydantic-settings → 全局单例 settings（优先级：环境变量 > .env > 默认值）
+│   ├── paths.py                       # 路径常量（PROJECT_ROOT 锚定，不依赖运行时 CWD）
+│   └── port_check.py                  # 启动端口自检（仅标准库；治"服务显示启动成功但 0 请求"的 Windows 端口抢占）
 │
-├── crawler/                           # 数据采集模块（独立数据管道）
+├── crawler/                           # 离线数据采集：独立数据管道，故放根目录、与 src 应用解耦（见 §2.2.1）
 │   ├── __init__.py
-│   ├── medical_crawler.py             # 医疗网站爬虫（支持多数据源）
-│   ├── data_processor.py              # 数据清洗与处理（去重、格式化、统计）
-│   └── README.md                      # 爬虫使用说明
+│   ├── medical_crawler.py             # 爬取：robots.txt 在线解析 + 3~5s 随机延时 + UA 池 + tenacity 重试
+│   ├── data_processor.py              # 清洗去重 → JSON（程序用）+ Excel（人工看）
+│   └── README.md                      # 用法：python crawler/medical_crawler.py [--max N] [--reset]
 │
-├── src/                               # 源代码目录（应用核心）
+├── src/                               # 应用核心（8 个子包）
 │   ├── __init__.py
 │   │
-│   ├── common/                        # 公共模块
+│   ├── common/                        # 公共工具（7 个模块，逐个在对应课时引入，别在 Day 1 一次生成）
 │   │   ├── __init__.py
-│   │   ├── logger.py                  # 统一日志配置（文件+控制台）
-│   │   ├── llm.py                     # LLM 客户端封装
-│   │   ├── neo4j_client.py            # Neo4j 数据库客户端（单例）
-│   │   ├── embedding_model.py         # 向量嵌入模型（单例）
-│   │   └── utils.py                   # 通用工具函数
+│   │   ├── logger.py                  # setup_logger(name, log_file)：文件 + 控制台双输出
+│   │   ├── llm.py                     # get_llm() 单例；get_extract_llm() 可把抽取切到本地 vLLM 微调模型
+│   │   ├── utils.py                   # clean_text / retry_on_error / timer
+│   │   ├── tokens.py                  # token 计数（tiktoken，不可用则降级启发式）+ 预算裁剪
+│   │   ├── memory.py                  # SessionMemory（早期内存方案，请求路径已不用）+ format_history（仍被 Agent 用）
+│   │   ├── observe.py                 # tracing：Langfuse > LangSmith > no-op，env 门控
+│   │   └── answer_cache.py            # L1 Redis 精确 + L2 语义缓存（三把钥匙都含 user_id）
 │   │
-│   ├── extraction/                    # 实体关系抽取模块
+│   ├── extraction/                    # LLM 实体/关系抽取（Day 2）
 │   │   ├── __init__.py
-│   │   ├── schemas.py                 # Pydantic 模型定义
-│   │   ├── disease_extractor.py       # 疾病实体抽取
-│   │   ├── symptom_extractor.py       # 症状实体抽取
-│   │   ├── drug_extractor.py          # 药物实体抽取
-│   │   └── department_extractor.py    # 科室实体抽取
+│   │   ├── schemas.py                 # Pydantic 模型 + DiseaseExtractionResult 聚合体
+│   │   ├── disease_extractor.py       # extract() → DiseaseExtractionResult（实体 + 关系，temperature=0 最稳）
+│   │   ├── symptom_extractor.py       # extract() → list[SymptomEntity]
+│   │   ├── drug_extractor.py          # extract() → list[MedicationEntity]
+│   │   └── department_extractor.py    # extract() → list[DepartmentEntity]
 │   │
-│   ├── knowledge_graph/               # 知识图谱模块
+│   ├── knowledge_graph/               # 图谱 Schema / 建图 / 查询 / 校验 / Text2Cypher
 │   │   ├── __init__.py
-│   │   ├── schema.py                  # Neo4j Schema 定义
-│   │   ├── graph_builder.py           # 图谱构建（MERGE 幂等操作）
-│   │   ├── graph_validator.py         # 图谱验证（孤立节点检测）
-│   │   └── graph_queries.py           # 图谱查询封装
+│   │   ├── schema.py                  # ★ 8 节点 + 12 关系 + 值域枚举的唯一主人（R1）；含 LLM 用的 schema 文本生成
+│   │   ├── schema_manager.py          # 约束与索引的初始化 / 校验
+│   │   ├── graph_builder.py           # MERGE 幂等建图：python -m src.knowledge_graph.graph_builder {clear|build}
+│   │   ├── graph_queries.py           # 只读查询封装（Agent 与 @tool 共用）
+│   │   ├── graph_validator.py         # 质量校验：连接 / 计数 / 孤立节点 / 疾病完整性
+│   │   └── text2cypher.py             # 自然语言 → Cypher，只读事务 + 记录数上限 + 写操作防护
 │   │
-│   ├── agents/                        # 多 Agent 系统模块（扁平结构）
+│   ├── vector_store/                  # 向量检索（就一个实现文件，别再拆）
 │   │   ├── __init__.py
-│   │   ├── state.py                   # Agent 状态定义（TypedDict）
-│   │   ├── graph.py                   # LangGraph 编排（状态图）
-│   │   ├── base_agent.py              # Agent 基类
-│   │   ├── intent_classifier.py       # 意图识别 Agent
-│   │   ├── symptom_detector.py        # 症状检测 Agent
-│   │   ├── department_recommender.py  # 科室推荐 Agent
-│   │   ├── medication_advisor.py      # 用药建议 Agent
-│   │   ├── medical_knowledge.py       # 医学知识 Agent
-│   │   ├── pre_visit_advisor.py       # 就医指导 Agent
-│   │   ├── safety_checker.py          # 安全检查 Agent
-│   │   ├── answer_fusion.py           # 答案融合 Agent
-│   │   └── general_chat.py            # 通用对话 Agent
+│   │   └── search.py                  # VectorRetriever：FAISS 语义召回 + Neo4j 精确匹配合并；link_entities() 实体链接；
+│   │                                  #   get_shared_retriever() 进程级单例。⚠ BGE-M3 懒加载且只允许本地目录（禁联网回退）
 │   │
-│   ├── vector_store/                  # 向量检索模块
+│   ├── agents/                        # LangGraph 多 Agent：9 个节点 = graph.py 的 9 个 add_node
 │   │   ├── __init__.py
-│   │   ├── vector_store.py            # 向量存储（FAISS）
-│   │   ├── index_builder.py           # 索引构建
-│   │   └── search.py                  # 搜索功能
+│   │   ├── state.py                   # AgentState（TypedDict，10 个 operator.add 累加字段）+ IntentType（5 类）
+│   │   ├── graph.py                   # build_graph()/app、run()/run_stream()、route_by_intent/route_after_symptom
+│   │   ├── checkpointer.py            # SqliteSaver + build_thread_id()（thread_id 的唯一主人，契约见 §13）
+│   │   ├── tools.py                   # 4 个 @tool，只被 medical_knowledge 的 create_react_agent 调用
+│   │   ├── intent_classifier.py       # 意图识别（LLM · 结构化输出）
+│   │   ├── symptom_detector.py        # 症状检测（LLM · 结构化输出）
+│   │   ├── department_recommender.py  # 科室推荐（图谱候选仅作参考 → LLM 择优定案 → 回退图谱 → 追问）
+│   │   ├── medication_advisor.py      # 用药建议（图谱药物仅作参考 → LLM 按医疗红线取舍）
+│   │   ├── medical_knowledge.py       # 医学知识（强制检索打底 + 可选 ReAct 多跳）
+│   │   ├── pre_visit_advisor.py       # 就医指导（LLM · 结构化输出 + 规则兜底）
+│   │   ├── safety_checker.py          # 安全检查（本节点零 LLM：强制免责声明 / 急症置顶 / 特殊人群）
+│   │   ├── answer_fusion.py           # 答案融合（确定性拼装，不调 LLM）
+│   │   └── general_chat.py            # 通用对话（直连 END，不经安全检查——刻意取舍，见 §6）
 │   │
-│   └── api/                           # API 服务模块（扁平结构）
+│   ├── history/                       # 对话历史冷热分层 ⚠ 本目录无 __init__.py（隐式命名空间包，见下方"待清理"）
+│   │   ├── store.py                   # Redis 热缓存(12 轮/TTL 24h) + MySQL 事实源；双写先 MySQL；load_context 三级命中
+│   │   └── summarizer.py              # 窗口外旧轮增量摘要（水位 conversations.summary_msg_id；安全信息强制保留）
+│   │
+│   ├── auth/                          # 用户认证与会话归属 ⚠ 本目录无 __init__.py
+│   │   ├── security.py                # bcrypt（SHA-256 预哈希，rounds=12）+ PyJWT（HS256）
+│   │   ├── store.py                   # 用户表与会话归属
+│   │   └── deps.py                    # get_current_user + 归属裁决（越权统一转 404，不泄露存在性）
+│   │
+│   └── api/                           # FastAPI：单进程同时托管 API 与前端静态文件
 │       ├── __init__.py
-│       ├── main.py                    # FastAPI 应用入口（含前端静态文件托管）
-│       ├── routes.py                  # API 路由（问诊/健康检查/统计）
-│       └── models.py                  # 请求/响应 Pydantic 模型
+│       ├── main.py                    # 应用装配 / lifespan 预热 / CORS 白名单 / MAX_CONCURRENCY / /assets 挂载 + SPA 兜底路由
+│       ├── routes.py                  # /consult /consult/stream(SSE) /health /stats /conversations*；REQUEST_TIMEOUT=60s
+│       ├── auth_routes.py             # /auth/register(201/409) /auth/login(OAuth2 表单) /auth/me
+│       └── models.py                  # ★ R3 前后端字段契约的唯一主人（11 个响应字段，含 linked_entities / cached / duration_ms）
 │
-├── frontend/                          # 前端模块（Vue 3 + Element Plus 独立项目）
+├── frontend/                          # Vue 3 + Element Plus + Vite（独立 npm 项目）
 │   ├── index.html                     # 入口 HTML
-│   ├── package.json                   # 依赖与脚本配置
-│   ├── vite.config.js                 # Vite 构建配置（含 /api 代理）
+│   ├── package.json / package-lock.json
+│   ├── vite.config.js                 # @ → src 别名；dev 端口 5173；/api 代理 target 用 127.0.0.1（避开 ::1 解析回退）
+│   ├── .gitignore                     # node_modules / dist
 │   ├── src/
-│   │   ├── main.js                    # 应用入口（挂载 Element Plus）
-│   │   ├── App.vue                    # 根组件
-│   │   ├── api/index.js               # axios 封装（调用 FastAPI）
-│   │   ├── views/ChatView.vue         # 聊天主界面
-│   │   └── components/                # 组件（消息气泡、免责声明横幅）
-│   └── dist/                          # npm run build 产物（静态文件，由 FastAPI 托管）
+│   │   ├── main.js                    # 挂载 Element Plus
+│   │   ├── App.vue                    # 登录网关（无 token → LoginView）+ 主界面切换
+│   │   ├── api/index.js               # axios（baseURL=/api, timeout=65s）+ SSE consultStream + 令牌管理
+│   │   ├── utils/markdown.js          # renderMarkdown()：marked + DOMPurify 的唯一渲染入口（不得绕过）
+│   │   ├── views/
+│   │   │   ├── ChatView.vue           # 聊天主界面 + 侧栏历史 + 系统状态 + 用户卡片 + 欢迎页能力卡片
+│   │   │   └── LoginView.vue          # 登录 / 注册
+│   │   └── components/
+│   │       ├── ChatMessage.vue        # 消息气泡（症状/科室/药物标签、耗时、知识定位）
+│   │       └── DisclaimerBanner.vue   # 免责声明横幅（不可关闭）
+│   └── dist/                          # [产物] npm run build 输出，由 FastAPI 同源托管
 │
-├── data/                              # 数据目录
-│   ├── raw/                           # 原始数据（爬虫输出）
-│   │   ├── diseases.json              # 爬取的原始数据
-│   │   └── .crawl_checkpoint.json     # 断点续爬记录
-│   ├── processed/                     # 处理后的数据（清洗后）
-│   │   ├── diseases.json              # JSON 格式（程序使用）
-│   │   └── diseases.xlsx              # Excel 格式（人工查看）
-│   ├── knowledge_graph/               # 知识图谱中间数据
-│   │   ├── entities.json              # 抽取的实体列表
-│   │   ├── relations.json             # 抽取的关系列表
-│   │   └── .extraction_checkpoint.json # 抽取断点记录
-│   └── indexes/                       # FAISS 索引
-│       ├── faiss.index                # 向量索引文件
-│       └── entities.json              # 实体元数据
+├── scripts/                           # 入口脚本（离线流水线 + 验收器）⚠ 无 __init__.py，按文件直接运行
+│   ├── run_extraction.py              # LLM 批量抽取 → data/knowledge_graph/*.json（**只有 --resume 才续跑**，否则清空重抽）
+│   ├── build_index.py                 # BGE-M3 向量化 → data/indexes/（IndexIVFFlat，nlist=100 / nprobe=10 / 内积）
+│   ├── enrich_medications.py          # 药物字段增补（副作用 / 禁忌 / 相互作用）
+│   ├── migrate_relation_types.py      # 历史关系名归一（一次性、幂等；不是方向翻转）
+│   ├── build_finetune_dataset.py      # 抽取产物 → 微调数据集 → data/finetune/ft_extract.json（Day 7）
+│   ├── check_contracts.py             # ★ R1/R3/R4/R5 统一验收器（退出码 0=全绿；--no-db 跳过 R5）
+│   ├── integration_test.py            # 端到端 API 冒烟 15 项（健康/图谱/认证 7 项/问诊/越权 4 项/SSE）
+│   ├── test_config.py                 # 配置层冒烟
+│   ├── start_api.py                   # 一键启动（缺前端自动构建；启动期主线程预加载嵌入栈，治 arrow.dll 崩溃）
+│   ├── smoke_test_vllm_extract.py     # 微调模型 vLLM 连通性冒烟
+│   ├── e2e_test_extract_via_vllm.py   # 抽取走 vLLM 的端到端验证
+│   └── schema.cypher                  # 约束/索引初始化 Cypher（由 schema.py 生成，与之同源）
 │
-├── models/                            # 本地模型文件
-│   └── bge-m3/                        # BGE-M3 嵌入模型
+├── evals/                             # 评估体系（Day 4）
+│   ├── __init__.py
+│   ├── dataset.jsonl                  # [入库] 53 条金标问答（id 前缀 a/m/k/e/g/t）
+│   ├── runner.py                      # 双模式：offline graph.run() 测"大脑" / e2e 走 POST /api/consult；硬门禁退出码
+│   ├── judge.py                       # LLM-as-a-judge（correctness/completeness/safety/harmlessness）+ RAGAS 包装
+│   ├── extract_finetune_vs_cloud.py   # 微调 vs 云端抽取对比（Day 7）
+│   ├── ci_github_actions.yml          # GitHub Actions 参考模板（需自行拷到 .github/workflows/ 才生效）
+│   ├── last_report*.md                # [产物] 评估报告；last_report.md = 最新一次
+│   └── results/                       # [产物] 对比结果 JSON
 │
-├── logs/                              # 日志目录
-│   ├── crawler.log                    # 爬虫日志
-│   ├── extraction.log                 # 实体抽取日志
-│   ├── graph_builder.log              # 图谱构建日志
-│   └── api.log                        # API 服务日志
+├── data/                              # [全部产物，不入库] R5：数据是代码的构建产物，契约变更只做 clear + build 重建
+│   ├── raw/                           # 爬虫原始输出（diseases.json + .crawl_checkpoint.json）
+│   ├── processed/                     # 清洗后（diseases.json / diseases.xlsx）
+│   ├── knowledge_graph/               # 抽取产物 entities.json / relations.json（+ .extraction_checkpoint.json）
+│   ├── indexes/                       # faiss.index + entities.json（索引 ID → 实体映射，实体链接的数据源）
+│   ├── checkpoints/                   # agent_checkpoints.sqlite（执行态快照，非事实源，可随时删）
+│   ├── cache/                         # semantic_cache.json / .npz（L2 语义缓存）
+│   └── finetune/                      # ft_extract.json（微调数据集）
 │
-├── scripts/                           # 脚本目录（入口点）
-│   ├── run_crawler.py                 # 运行爬虫
-│   ├── run_extraction.py              # 运行实体抽取
-│   ├── build_graph.py                 # 构建知识图谱
-│   ├── build_index.py                 # 构建向量索引
-│   ├── start_api.py                   # 启动 API 服务（同时托管前端静态文件）
-│   └── validate_environment.py        # 环境验证
-│
-└── tests/                             # 测试目录
-    ├── unit/                          # 单元测试
-    │   ├── test_crawler.py
-    │   ├── test_extractor.py
-    │   └── test_agents.py
-    └── integration/                   # 集成测试
-        ├── test_graph_builder.py
-        └── test_api.py
+├── models/                            # [产物] bge-m3/（约 2.2 GB，手动下载，见 §4 技术选型）
+└── logs/                              # [产物] 分模块日志（api / agents / extraction / cache / observe / history …）
 ```
+
+**旧版这一节列过、但仓库里其实不存在的东西**（设计期遗留，本节已按真实文件重写）：
+`tests/` 整个目录（无 pytest 套件，测试落地见 §7 的三层）、`src/agents/base_agent.py`（各 Agent 直接是类 + 模块级单例，没有公共基类）、
+`src/common/neo4j_client.py` 与 `src/common/embedding_model.py`（Neo4j 连接没有独立客户端模块，由 `knowledge_graph/` 的
+`graph_queries.py` / `graph_builder.py` / `graph_validator.py` / `schema_manager.py` 各自持 driver；
+嵌入模型也没有独立模块，由 `vector_store/search.py` 懒加载 + `get_shared_retriever()` 进程级单例）、`src/vector_store/vector_store.py` 与 `index_builder.py`
+（检索只有 `search.py` 一个实现，索引构建在 `scripts/build_index.py`）、`scripts/run_crawler.py`（直接 `python crawler/medical_crawler.py`）、
+`scripts/build_graph.py`（`python -m src.knowledge_graph.graph_builder`）、`scripts/validate_environment.py`（环境验证在根目录 `validate_env.py`）。
+
+**⚠ 这些遗留名字在本文件后面的章节里还留着**（§2.2 示例代码、§3 数据流、§5 接口设计、§6 安全设计中的
+"核心类/示意代码"是**设计期草图**，不是现状实现）。读到它们时按下表换算，**否则照抄会 import 到不存在的模块**：
+
+| 后文草图里的写法 | 仓库里的真实现 |
+|---|---|
+| `from src.common.neo4j_client import neo4j_client` / `neo4j_client.run(...)` | 无此模块。用 `src/knowledge_graph/graph_queries.py` 的 `GraphQueries()`（只读查询，Agent/工具共用）或 `graph_builder.py` 自建 driver |
+| `from src.common.embedding_model import embedding_model` | 无此模块。用 `src/vector_store/search.py` 的 `get_shared_retriever()._get_embedding_model()`（BGE-M3 懒加载、禁联网回退） |
+| `class VectorStore` / `vector_store/vector_store.py` | 实为 `src/vector_store/search.py` 的 `VectorRetriever`（FAISS + Neo4j 混合、`link_entities()`） |
+| `vector_store/index_builder.py` | 实为 `scripts/build_index.py`（IndexIVFFlat，nlist=100 / nprobe=10 / 内积） |
+| `class GraphBuilder` | 实为 `src/knowledge_graph/graph_builder.py` 的 `KnowledgeGraphBuilder` |
+| `create_indexes()`（草图里手写索引语句） | 实为 `schema.py` 的 `generate_constraint_cypher()` / `generate_index_cypher()` 生成 + `schema_manager.py` 执行（R1：不手写） |
+| `(d1:Drug)` | 节点 label 是 **`Medication`**（`NodeType` 无 `Drug`） |
+| `-[:RELATED_TO {relation_type:...}]->` | **不在 12 类关系契约内**，`check_contracts.py` 的 R5 会判为违规。疾病间关联语义只作为抽取字段 `DiseaseRelationType`（complication/comorbidity/causal/similar）存在，不落图关系 |
+| `tests/unit/test_extractor.py` 等 pytest 片段 | 无 `tests/`。见 §7 三层验收表 |
+
+**一处待清理的不一致（如实记录，别当已解决）**：`src/history/`、`src/auth/`、`scripts/` 三个目录没有 `__init__.py`，
+靠隐式命名空间包工作——功能上没问题，但与 `src/` 其余子包风格不一致，补空 `__init__.py` 是零风险改动。
 
 ### 2.2 项目结构设计说明
 
@@ -610,6 +678,8 @@ def get_llm() -> ChatOpenAI:
     )
 ```
 
+> ⚠ **设计期草图，非现状实现**：下面这段代码里的模块/类名在当前仓库中并不存在，照抄会 `ImportError`。真实现与对应关系见 §2.1 末尾的换算表；本节只保留其**设计意图**，不作为可执行参考。
+
 ```python
 # common/neo4j_client.py
 from neo4j import GraphDatabase
@@ -719,7 +789,7 @@ class MedicalCrawler:
         if not self.robots_checker.is_allowed(url):
             logging.warning(f"[BLOCKED] robots.txt disallows: {url}")
             return None
-    
+  
         # 随机 User-Agent
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         response = self.session.get(url, headers=headers, timeout=15)
@@ -737,7 +807,7 @@ class MedicalCrawler:
         html = self._fetch(url)
         if not html:
             return None
-    
+  
         soup = BeautifulSoup(html, "html.parser")
         disease = {
             "name": soup.find("h1").get_text(strip=True),
@@ -788,10 +858,10 @@ class DataProcessor:
         if not input_file.exists():
             logging.error(f"Raw data file not found: {input_file}")
             return False
-    
+  
         with open(input_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-    
+  
         self.raw_data = data.get("diseases", [])
         self.stats["total_raw"] = len(self.raw_data)
         return True
@@ -800,7 +870,7 @@ class DataProcessor:
         """去除重复数据（按疾病名称）"""
         seen_names = set()
         unique_data = []
-    
+  
         for disease in self.raw_data:
             name = disease.get("name", "").strip()
             if not name or name in seen_names:
@@ -808,7 +878,7 @@ class DataProcessor:
                 continue
             seen_names.add(name)
             unique_data.append(disease)
-    
+  
         self.raw_data = unique_data
   
     def clean_text(self, text: str) -> str:
@@ -824,23 +894,23 @@ class DataProcessor:
     def generate_statistics(self) -> Dict:
         """生成数据统计"""
         from collections import Counter
-    
+  
         # 按来源统计
         source_counter = Counter(d["source"] for d in self.cleaned_data)
-    
+  
         # 统计症状
         all_symptoms = []
         for d in self.cleaned_data:
             all_symptoms.extend(d.get("symptoms", []))
         symptom_counter = Counter(all_symptoms)
-    
+  
         # 字段覆盖率
         fields = ["description", "symptoms", "department", "treatment"]
         coverage = {}
         for field in fields:
             count = sum(1 for d in self.cleaned_data if d.get(field))
             coverage[field] = f"{count}/{len(self.cleaned_data)}"
-    
+  
         return {
             "total": len(self.cleaned_data),
             "by_source": dict(source_counter),
@@ -946,7 +1016,7 @@ class DiseaseExtractor:
     def __init__(self):
         self.llm = get_llm()
         self.parser = PydanticOutputParser(pydantic_object=DiseaseEntity)
-    
+  
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个医学信息抽取专家。请从以下文本中提取疾病信息，并按照指定格式输出。
 
@@ -999,128 +1069,126 @@ DISEASE_EXTRACTION_PROMPT = """
 
 **Neo4j Schema 设计**：
 
+> ★ **唯一事实来源是 `src/knowledge_graph/schema.py`**（`NodeType` / `RelationType` 两个枚举）。
+> 下面两块只是给人看的可读示意，与 `schema.py` 不一致时**以 `schema.py` 为准**（R1）；
+> 新增/改名一律先改 `schema.py`，再回来同步这一节，并跑 `python scripts/check_contracts.py --r1 --r5`。
+
 **节点类型（8 种）**：
 
 ```cypher
-// 疾病节点
-(d:Disease {
-    name: "高血压",
-    description: "高血压是指...",
-    created_at: timestamp()
-})
+// 疾病节点（唯一约束 name；索引 name, icd_code）
+(d:Disease {name: "高血压", description: "血压长期高于正常水平...", icd_code: "I10",
+            aliases: ["血压高"], created_at: datetime(), updated_at: datetime()})
 
-// 症状节点
-(s:Symptom {
-    name: "头痛",
-    description: "头部疼痛...",
-    severity: "medium"  // low/medium/high
-})
+// 症状节点（唯一约束 name；索引 name, severity）
+(s:Symptom {name: "头痛", description: "头部疼痛...", severity: "medium", duration: "数天"})
 
-// 药物节点
-(dr:Drug {
-    name: "氨氯地平",
-    category: "钙通道阻滞剂",
-    side_effects: ["脚踝水肿", "面部潮红"],
-    contraindications: ["严重低血压"]
-})
+// 药物节点 ——⚠ label 是 Medication，不是 Drug
+(m:Medication {name: "氨氯地平", category: "钙通道阻滞剂", side_effects: ["脚踝水肿", "面部潮红"],
+               contraindications: ["严重低血压"], dosage: "每日一次，一次 5mg"})
 
-// 科室节点
-(dep:Department {
-    name: "心血管内科",
-    description: "专门治疗心脏和血管疾病"
-})
+// 科室节点（唯一约束 name；索引 name）
+(dep:Department {name: "心血管内科", description: "诊治心脏和血管疾病",
+                 floor: "门诊 3 层", parent_department: "内科"})
 
-// 检查节点
-(e:Examination {
-    name: "血压测量",
-    purpose: "检测血压水平",
-    preparation: "安静休息 5 分钟后测量"
-})
+// 身体部位节点（唯一约束 name；索引 name, system）
+(bp:BodyPart {name: "心脏", description: "循环系统的核心器官", system: "循环系统"})
 
-// 治疗方案节点
-(t:Treatment {
-    name: "药物治疗",
-    description: "使用药物控制血压"
-})
+// 检查节点（唯一约束 name；索引 name, type）
+(e:Examination {name: "血压测量", type: "实验室检查", purpose: "检测血压水平",
+                preparation: "安静休息 5 分钟后测量"})
 
-// 身体部位节点
-(bp:BodyPart {
-    name: "心脏",
-    description: "循环系统的核心器官"
-})
+// 食物节点（唯一约束 name；索引 name, type）—— type 取值：推荐 / 禁忌
+(f:Food {name: "低盐饮食", type: "推荐", description: "每日食盐不超过 5 克"})
 
-// 医学概念节点
-(mc:MedicalConcept {
-    name: "血压",
-    definition: "血液在血管中流动时对血管壁的压力"
-})
+// 注意事项节点 ——⚠ 主键属性是 content（没有 name），当前不设唯一约束，只索引 category
+(pc:Precaution {content: "定期监测血压", category: "生活方式", importance: "high"})
 ```
+
+> **另有 2 个不在 `NodeType` 里的辅助 label**：`graph_builder` 备有 `Treatment` 建边模板（现网数据里确实存在，Day 2 实测 1886 个节点），
+> `MedicalConcept` 出现在 §0 R5 的允许集合里。它们**不是契约节点类型**——`schema.py` 不定义、R5 放行。
+> 讲课时别说成"8 种节点之一"；当前抽取数据只覆盖 8 种契约节点中的 6 种（`Food` / `Precaution` 无数据）。
 
 **关系类型（12 种）**：
 
 ```cypher
-// 疾病-症状关系
+// 疾病-症状
 (d:Disease)-[:HAS_SYMPTOM {frequency: "common"}]->(s:Symptom)
 
-// 症状-疾病关系（反向）
+// 症状-疾病（反向）——R6 历史例外 ①
 (s:Symptom)-[:MAY_INDICATE {probability: "medium"}]->(d:Disease)
 
-// 疾病-科室关系
-(d:Disease)-[:BELONG_TO_DEPARTMENT {priority: 1}]->(dep:Department)
+// 疾病-科室 ——⚠ 是 BELONGS_TO_DEPARTMENT（带 S），不是 BELONG_TO_DEPARTMENT
+(d:Disease)-[:BELONGS_TO_DEPARTMENT {priority: 1}]->(dep:Department)   // priority: 1=首选, 2=次选
 
-// 疾病-药物关系
-(d:Disease)-[:TREATED_BY_DRUG {evidence_level: "A"}]->(dr:Drug)
+// 疾病-药物 ——⚠ 是 TREATED_BY_MEDICATION，不是 TREATED_BY_DRUG
+(d:Disease)-[:TREATED_BY_MEDICATION {evidence_level: "A", is_first_line: true}]->(m:Medication)
 
-// 药物-疾病关系（反向）
-(dr:Drug)-[:TREATS_DISEASE]->(d:Disease)
+// 药物-疾病（反向）——R6 历史例外 ②
+(m:Medication)-[:TREATS_DISEASE]->(d:Disease)
 
-// 药物-副作用关系
-(dr:Drug)-[:HAS_SIDE_EFFECT {frequency: "common"}]->(s:Symptom)
+// 药物-副作用
+(m:Medication)-[:HAS_SIDE_EFFECT {frequency: "common"}]->(s:Symptom)
 
 // 药物-药物相互作用
-(dr1:Drug)-[:INTERACTS_WITH {severity: "high"}]->(dr2:Drug)
+(m:Medication)-[:INTERACTS_WITH {severity: "high", description: "增加出血风险"}]->(m2:Medication)
 
-// 疾病-检查关系
+// 疾病-检查 —— necessity: required / recommended / optional
 (d:Disease)-[:NEEDS_EXAMINATION {necessity: "required"}]->(e:Examination)
 
-// 疾病-身体部位关系
+// 疾病-身体部位
 (d:Disease)-[:AFFECTS_BODY_PART]->(bp:BodyPart)
 
-// 治疗方案-疾病关系
-(t:Treatment)-[:FOR_DISEASE]->(d:Disease)
-
-// 科室-疾病关系（反向）
+// 科室-疾病（反向）——R6 历史例外 ③
 (dep:Department)-[:HANDLES_DISEASE]->(d:Disease)
 
-// 疾病-疾病相关关系
-(d1:Disease)-[:RELATED_TO {relation_type: "complication"}]->(d2:Disease)
+// 疾病-饮食 —— recommendation_type: recommended / avoid
+(d:Disease)-[:RECOMMENDS_FOOD {recommendation_type: "recommended"}]->(f:Food)
+
+// 疾病-注意事项
+(d:Disease)-[:HAS_PRECAUTION {importance: "high"}]->(pc:Precaution)
 ```
+
+> **上面 12 条就是全部合法关系名。**旧版本节曾把 `FOR_DISEASE`（治疗方案-疾病）与 `RELATED_TO`（疾病-疾病）列为示例，
+> 这两个**都不在契约内，照写会被 `check_contracts.py` 的 R5 判为违规**：
+>
+> - 「治疗方案」只作为 `Treatment` 辅助节点存在，不落图关系；
+> - 疾病间关联（并发症 / 合并症 / 因果 / 相似）只是**抽取字段** `DiseaseRelationType` 的取值，不是图关系类型。
+>   `schema.py` 里它原名也叫 `RelationType`，因与图关系契约重名才改名（R1 名字唯一主人）。
+>
+> **现网实况（2026-10 实测）**：Neo4j 里只有 **5 种正向关系**有数据——
+> `HAS_SYMPTOM 3171` / `TREATED_BY_MEDICATION 2530` / `AFFECTS_BODY_PART 2147` / `BELONGS_TO_DEPARTMENT 657` / `NEEDS_EXAMINATION 178`；
+> 三条反向历史例外（`MAY_INDICATE` / `TREATS_DISEASE` / `HANDLES_DISEASE`）当前**各 0 条**，
+> 因为现行抽取只产正向关系（见 `scripts/run_extraction.py` 的 `serialize_relations()`）。反向查询用 Cypher 反向遍历表达，见 §0 R6。
+
+> ⚠ **设计期草图，非现状实现**：下面这段代码里的模块/类名在当前仓库中并不存在，照抄会 `ImportError`。真实现与对应关系见 §2.1 末尾的换算表；本节只保留其**设计意图**，不作为可执行参考。
 
 **核心类**：
 
 ```python
 # knowledge_graph/graph_builder.py
-from src.common.neo4j_client import neo4j_client
+from src.knowledge_graph.schema_manager import SchemaManager   # 约束/索引由它统一管理，别手写语句
+from neo4j import GraphDatabase
+from config.settings import settings
 from typing import Dict
 
-class GraphBuilder:
-    """知识图谱构建器"""
-  
+class KnowledgeGraphBuilder:
+    """知识图谱构建器（真实类名是 KnowledgeGraphBuilder，不是草图里的 GraphBuilder）"""
+
+    def __init__(self):
+        self.driver = GraphDatabase.driver(
+            settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+
     def create_indexes(self):
-        """创建索引，加速查询"""
-        neo4j_client.run("""
-            CREATE INDEX disease_name IF NOT EXISTS
-            FOR (d:Disease) ON (d.name)
-        """)
-        neo4j_client.run("""
-            CREATE INDEX symptom_name IF NOT EXISTS
-            FOR (s:Symptom) ON (s.name)
-        """)
-        neo4j_client.run("""
-            CREATE INDEX drug_name IF NOT EXISTS
-            FOR (dr:Drug) ON (dr.name)
-        """)
-  
+        """创建约束与索引：委托 SchemaManager，不手写 Cypher（R1）。
+
+        ⚠ 语句由 schema.py 的 generate_constraint_cypher() / generate_index_cypher()
+        从 NODE_SCHEMAS 生成，再由 schema_manager.initialize_schema() 执行——
+        改一处 schema，约束索引自动跟上，不会出现「8 种节点只建了 3 个约束」。
+        （SchemaManager() 无参构造，内部自建 driver。）
+        """
+        return SchemaManager().initialize_schema()
+
     def merge_disease_node(self, disease_data: Dict):
         """创建或更新疾病节点"""
         query = """
@@ -1144,7 +1212,7 @@ class GraphBuilder:
         if properties:
             set_clause = ", ".join([f"r.{k} = ${k}" for k in properties.keys()])
             query += f" ON CREATE SET {set_clause}"
-    
+  
         params = {
             "start_name": start_node,
             "end_name": end_node,
@@ -1158,6 +1226,8 @@ class GraphBuilder:
 #### 模块 5：向量检索模块 (`src/vector_store/`)
 
 **职责**：使用 FAISS 实现语义搜索
+
+> ⚠ **设计期草图，非现状实现**：下面这段代码里的模块/类名在当前仓库中并不存在，照抄会 `ImportError`。真实现与对应关系见 §2.1 末尾的换算表；本节只保留其**设计意图**，不作为可执行参考。
 
 **核心类**：
 
@@ -1180,7 +1250,7 @@ class VectorStore:
         # entities: [{"name": "高血压", "type": "Disease", "description": "..."}]
         texts = [f"{e['name']} {e.get('description', '')}" for e in entities]
         embeddings = embedding_model.encode(texts)
-    
+  
         # 构建 FAISS 索引
         dimension = embeddings.shape[1]
         self.index = faiss.IndexFlatL2(dimension)
@@ -1191,14 +1261,14 @@ class VectorStore:
         """语义搜索"""
         query_embedding = embedding_model.encode([query])
         distances, indices = self.index.search(np.array(query_embedding), top_k)
-    
+  
         results = []
         for idx, distance in zip(indices[0], distances[0]):
             if idx < len(self.entities):
                 entity = self.entities[idx].copy()
                 entity["score"] = float(1 / (1 + distance))  # 转换为相似度分数
                 results.append(entity)
-    
+  
         return results
   
     def save_index(self, path: str):
@@ -1227,10 +1297,9 @@ class VectorStore:
 from typing import TypedDict, List, Optional
 
 class AgentState(TypedDict):
-    """Agent 状态"""
-    user_id: str
-    session_id: str
-    user_input: str
+    """Agent 状态（与当前 src/agents/state.py 一致；V1 稿的 user_id/session_id 已移除）"""
+    query: str        # 本轮用户原始问题
+    history: list     # 多轮上下文：API 层按 session 从历史存储注入（含归属校验与 token 预算）
   
     # 意图识别结果
     intent: Optional[str]  # "appointment" | "treatment" | "knowledge" | "other"
@@ -1283,7 +1352,7 @@ class IntentClassifierAgent:
     def __init__(self):
         self.llm = get_llm()
         self.parser = PydanticOutputParser(pydantic_object=IntentResult)
-    
+  
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个医疗问诊意图识别专家。请判断用户的意图类型：
 
@@ -1306,10 +1375,10 @@ class IntentClassifierAgent:
         )
         response = self.llm.invoke(formatted_prompt)
         result = self.parser.parse(response.content)
-    
+  
         state["intent"] = result.intent
         state["messages"].append(f"意图识别：{result.intent} (置信度: {result.confidence})")
-    
+  
         return state
 ```
 
@@ -1338,7 +1407,7 @@ class SymptomDetectorAgent:
     def __init__(self):
         self.llm = get_llm()
         self.parser = PydanticOutputParser(pydantic_object=SymptomResult)
-    
+  
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个医学症状检测专家。请从用户描述中提取症状信息：
 
@@ -1358,12 +1427,12 @@ class SymptomDetectorAgent:
         )
         response = self.llm.invoke(formatted_prompt)
         result = self.parser.parse(response.content)
-    
+  
         state["symptoms"] = result.symptoms
         state["severity"] = result.severity
         state["is_emergency"] = result.is_emergency
         state["messages"].append(f"症状检测：{result.symptoms} (严重程度: {result.severity})")
-    
+  
         return state
 ```
 
@@ -1443,19 +1512,16 @@ def create_medical_qa_graph():
     app = workflow.compile()
     return app
 
-def call_langgraph_ai(user_id: str, session_id: str, user_content: str) -> str:
-    """调用 LangGraph AI 系统"""
+def run(query: str, history: list | None = None) -> dict:
+    """调用 LangGraph AI 系统（与当前 src/agents/graph.py 的 run 一致）。
+
+    多轮上下文 history 由 API 层从历史存储注入（已含归属校验与 token 预算），
+    图本身无状态：每次调用新建 initial_state，不依赖外部 user_id/session_id 参数。
+    """
     app = create_medical_qa_graph()
-  
-    initial_state = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "user_input": user_content,
-        "messages": []
-    }
-  
+    initial_state = create_initial_state(query, history=history)
     final_state = app.invoke(initial_state)
-    return final_state["final_answer"]
+    return final_state  # 完整 AgentState；API 层从中取 final_answer/intent/... 组装响应
 ```
 
 ---
@@ -1506,21 +1572,20 @@ from src.agents.graph import call_langgraph_ai
 
 router = APIRouter()
 
-@router.post("/process", response_model=ConsultationResponse)
-def process_consultation(req: ConsultationRequest):
-    """处理用户问诊请求"""
-    answer = call_langgraph_ai(
-        user_id=req.data.user_id,
-        session_id=req.data.session_id,
-        user_content=req.data.user_content
+@router.post("/consult", response_model=ConsultationResponse)
+def consult(req: ConsultationRequest, current_user: User = Depends(get_current_user)):
+    """处理用户问诊请求（V2：登录必需；历史按归属注入上下文）"""
+    history = history_store.load_context(req.session_id, current_user.id)  # 归属裁决 + token 预算
+    result = run(req.query, history)
+    # 本轮双写历史（先 MySQL 再 Redis），assistant 落库后触发后台增量摘要
+    history_store.persist_turn(req.session_id, "user", req.query, user_id=current_user.id)
+    history_store.persist_turn(
+        req.session_id, "assistant", result["final_answer"],
+        intent=result["intent"], user_id=current_user.id
     )
-  
-    return ConsultationResponse(
-        result={
-            "answer": answer,
-            "timestamp": datetime.now().isoformat()
-        }
-    )
+    # 其余字段（symptoms/departments/medications/disclaimers/warnings/duration_ms）
+    # 同样从 result 中取出组装，见 src/api/routes.py 的 _build_response_from_state
+    return ConsultationResponse(answer=result["final_answer"], intent=result["intent"])
 ```
 
 ```python
@@ -1528,13 +1593,10 @@ def process_consultation(req: ConsultationRequest):
 from pydantic import BaseModel
 from typing import Dict, Any
 
-class ConsultationData(BaseModel):
-    user_id: str
-    session_id: str
-    user_content: str
-
 class ConsultationRequest(BaseModel):
-    data: ConsultationData
+    """V2 当前契约（src/api/models.py）：身份走令牌，请求体只带业务字段"""
+    query: str          # 本轮用户问题（1-1000 字）
+    session_id: str     # 前端生成的会话 ID（= conversations 主键 = Redis 热缓存 key）
 ```
 
 ```python
@@ -1975,6 +2037,8 @@ MERGE (d)-[:HAS_SYMPTOM]->(s)
 
 **输入**：
 
+> ⚠ **设计期草图，非现状实现**：下面这段代码里的模块/类名在当前仓库中并不存在，照抄会 `ImportError`。真实现与对应关系见 §2.1 末尾的换算表；本节只保留其**设计意图**，不作为可执行参考。
+
 ```python
 # 从 Neo4j 读取实体
 entities = neo4j_client.run("""
@@ -2013,17 +2077,14 @@ return results
 
 ### 5.2 API 接口
 
-#### 接口 1：POST /api/process
+#### 接口 1：POST /api/consult（V2：需登录，Bearer Token）
 
-**请求**：
+**请求**（V2 移除 `data` 包装与 `user_id`：身份由令牌携带，会话归属由服务端裁决）：
 
 ```json
 {
-  "data": {
-    "user_id": "user_01",
-    "session_id": "session_01",
-    "user_content": "我最近总是头疼，应该挂什么科？"
-  }
+  "query": "我最近总是头疼，应该挂什么科？",
+  "session_id": "session_01"
 }
 ```
 
@@ -2074,11 +2135,10 @@ GET /health
 
 ```python
 state = {
-    "user_id": "user_01",
-    "session_id": "session_01",
-    "user_input": "我最近总是头疼",
+    "query": "我最近总是头疼",
+    "history": [],
     "intent": None,
-    "symptoms": None,
+    "symptoms": [],
     "messages": []
 }
 ```
@@ -2087,11 +2147,10 @@ state = {
 
 ```python
 state = {
-    "user_id": "user_01",
-    "session_id": "session_01",
-    "user_input": "我最近总是头疼",
+    "query": "我最近总是头疼",
+    "history": [],
     "intent": "appointment",
-    "symptoms": None,
+    "symptoms": [],
     "messages": ["意图识别：appointment"]
 }
 ```
@@ -2155,21 +2214,64 @@ def check_emergency(symptoms: List[str]) -> bool:
 ### 6.3 药物相互作用检查
 
 ```python
-def check_drug_interactions(drugs: List[str]) -> List[dict]:
-    """检查药物相互作用"""
-    query = """
-    MATCH (d1:Drug)-[:INTERACTS_WITH]->(d2:Drug)
-    WHERE d1.name IN $drugs AND d2.name IN $drugs
-    RETURN d1.name AS drug1, d2.name AS drug2, r.severity AS severity
-    """
-    return neo4j_client.run(query, {"drugs": drugs})
+# 草图版（已废弃，别抄）：label 写成 :Drug（契约里是 Medication）、
+# RETURN 里引用了未绑定的 r（MATCH 没写 -[r:...]->，Cypher 直接报错）、且走不存在的 neo4j_client。
+# 下面是真实现：src/knowledge_graph/graph_queries.py 的 GraphQueries.get_medication_interactions()
+
+def get_medication_interactions(self, medication_name: str) -> list[dict]:
+    """查某药与其他药的相互作用（单药查询，不是批量 IN $drugs）"""
+    driver = self.get_driver()
+    with driver.session() as session:
+        result = session.run("""
+            MATCH (m1:Medication {name: $name})-[r:INTERACTS_WITH]->(m2:Medication)
+            RETURN m2.name AS drug,
+                   r.severity AS severity,
+                   r.description AS description
+        """, name=medication_name)
+        return [{"drug": r["drug"], "severity": r["severity"], "description": r["description"]}
+                for r in result]
+
+# ⚠ 医疗红线：图谱里查不到相互作用 ≠ 没有相互作用。tools.py 的 get_medication_info 在
+#   返回空时**不编造**，而是诚实声明「本系统未内置完整药物相互作用库，联用风险请以药师/权威数据库为准」。
+#   这条兜底必须保留——宁可说不知道，不可给患者一个虚假的安全感。
 ```
+
+### 6.4 用户认证与数据隔离（V2）
+
+**威胁模型**：V1 匿名设计下任何人可读写全部对话（三个安全缺口见 day05 讲义 §7.1）；
+医疗对话属敏感个人信息，是上线红线。方案 = **JWT 无状态认证 + 数据层归属裁决**。
+
+| 契约         | 设计                                                                                                                    | 当前代码                                    |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| 密码存储     | SHA-256 预哈希 + bcrypt 加盐（规避 bcrypt 72 字节对中文密码的截断）；全系统不存明文                                     | `src/auth/security.py`                    |
+| 令牌         | JWT HS256，payload`sub`(用户ID)/`role`/`exp`；`JWT_SECRET` 经 `.env` 注入，留空则进程级随机                   | `src/auth/security.py`                    |
+| 认证注入     | `Depends(get_current_user)` 统一挂载受保护路由；token 缺失/无效/过期/用户停用 → 401/403                              | `src/auth/deps.py`                        |
+| 归属绑定     | 首条消息落库惰性创建会话并绑定`user_id`；读写删他人会话 → `OwnershipError` → 路由转 **404**（不泄露存在性） | `src/history/store.py::_assert_owner`     |
+| 无主会话认领 | 认证前遗留的`user_id=''` 会话，由持有其 session_id 的登录用户原子认领（`UPDATE ... WHERE user_id=''`）              | `src/history/store.py::_claim_orphan`     |
+| 列表隔离     | `WHERE user_id = 当前用户`                                                                                            | `list_conversations`                      |
+| 防枚举       | 登录失败统一"用户名或密码错误"；他人会话统一 404                                                                        | `src/api/auth_routes.py` / `routes.py`  |
+| 切账号自愈   | 主动退出清 localStorage`session_id`；发送链路遇 404 自动轮换新会话重试一次                                            | `frontend/src/App.vue` / `ChatView.vue` |
+
+**users 表契约**：`id VARCHAR(64) PK`、`username VARCHAR(32) UNIQUE`、`password_hash VARCHAR(128)`、
+`role VARCHAR(16) DEFAULT 'user'`、`status VARCHAR(16) DEFAULT 'active'`、`created_at`、`last_login_at`。
 
 ---
 
 ## 7. 测试设计
 
-### 7.1 单元测试
+> **现状对账（2026-10-11）**：本仓库**没有 `tests/` 目录**，也没装 pytest。下面的 pytest 片段是
+> 「如果要做成标准套件该长这样」的样板，作迁移起点用；**课堂上真正跑的验收是下面三层**，
+> 全部靠模块自测 + 退出码，零测试框架依赖：
+>
+> | 层 | 命令 | 覆盖 | 失败行为 |
+> |---|---|---|---|
+> | ① 模块自测 | `python src/agents/state.py`、`python src/knowledge_graph/schema.py`、`python src/agents/checkpointer.py` … | 每个模块的关键契约与边界（`if __name__ == "__main__"` 段） | 退出码非 0 |
+> | ② 契约 + 集成 | `python scripts/check_contracts.py`（R1/R3/R4/R5）→ `python scripts/integration_test.py`（端到端 API 15 项，含认证与越权隔离） | 名字/字段/维度/数据一致性 + 四端点串通 | 退出码非 0 |
+> | ③ 评测门禁 | `python evals/runner.py`（53 条金标，`make eval-full`） | 答案质量：意图、症状 F1、科室 hit@3、急症召回、免责覆盖、RAGAS、LLM 裁判 | 硬规则不达标 → 退出码非 0，可进 CI |
+>
+> R7/R8 的"全绿才算完成"指的就是 ②③，不是 ①之外的 pytest。（§0 R8 黄金冒烟三条命令与此一致。）
+
+### 7.1 单元测试（样板，未落地）
 
 ```python
 # tests/unit/test_extractor.py
@@ -2187,16 +2289,13 @@ def test_disease_extractor():
 ### 7.2 集成测试
 
 ```python
-# tests/integration/test_agents.py
+# tests/integration/test_agents.py（V2 当前写法：run(query, history)）
 import pytest
-from src.agents.graph import call_langgraph_ai
+from src.agents.graph import run
 
 def test_medical_qa_system():
-    answer = call_langgraph_ai(
-        user_id="test_user",
-        session_id="test_session",
-        user_content="我最近总是头疼，应该挂什么科？"
-    )
+    state = run("我最近总是头疼，应该挂什么科？", history=[])
+    answer = state["final_answer"]
     assert "神经内科" in answer or "科室" in answer
     assert "免责声明" in answer or "就医" in answer
 ```
@@ -2204,23 +2303,30 @@ def test_medical_qa_system():
 ### 7.3 端到端测试
 
 ```python
-# tests/e2e/test_api.py
+# tests/e2e/test_api.py（V2 当前契约：先登录拿令牌，再带 Bearer 调 /api/consult）
 import pytest
 import requests
 
-def test_api_endpoint():
+BASE = "http://127.0.0.1:8000/api"
+
+def _login(username, password):
+    r = requests.post(f"{BASE}/auth/login", data={"username": username, "password": password})
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def test_api_endpoint(token):
     response = requests.post(
-        "http://127.0.0.1:8000/api/process",
-        json={
-            "data": {
-                "user_id": "test",
-                "session_id": "test",
-                "user_content": "高血压吃什么药？"
-            }
-        }
+        f"{BASE}/consult",
+        json={"query": "高血压吃什么药？", "session_id": "e2e-test"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 200
-    assert "result" in response.json()
+    assert response.json()["answer"]
+
+def test_consult_requires_login():
+    # 未登录一律 401（认证门禁，§6.4）
+    r = requests.post(f"{BASE}/consult", json={"query": "头疼", "session_id": "x"})
+    assert r.status_code == 401
 ```
 
 ---
@@ -2320,7 +2426,226 @@ RETURN s.name
 
 ---
 
-**文档版本**：v1.0
+---
+
+## 10. 对话历史与上下文管理设计（V2/V3）
+
+### 10.1 存储契约（冷热分层 + 归属 + 摘要水位）
+
+| 存储                | 结构                                                                                                                 | 说明                                                                                    |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `conversations`   | `id PK`、`user_id`(归属)、`title`、`summary TEXT`、`summary_msg_id BIGINT`、`created_at`、`updated_at` | `summary`=滚动摘要；`summary_msg_id`=**摘要水位**（该 id 之前的消息已摘要化） |
+| `messages`        | `id PK`、`conversation_id`(索引)、`role`、`content MEDIUMTEXT`、`intent`、`created_at`                   | 全量只追加；**摘要不删原文**（历史回看 + 医疗审计价值）                           |
+| Redis`sess:{sid}` | List，LPUSH+LTRIM 保留`HISTORY_MAX_TURNS` 轮，EXPIRE 24h                                                           | 热缓存；水位推进后`DEL` 并从 MySQL 回源重建，缓存永不越过水位                         |
+
+### 10.2 写路径（双写容错 + 后台增量摘要）
+
+1. `persist_turn`：先写 MySQL（事实源）再写 Redis；MySQL 失败本轮不落 Redis（防幻影数据）。
+2. assistant 轮落库后 → `summarizer.schedule_summarization`（每会话一把锁、daemon 线程，不阻塞问诊）。
+3. 触发条件：未摘要原文轮次 > `HISTORY_SUMMARY_MIN_KEEP` 且总 token > `HISTORY_MAX_TOKENS`。
+4. 切分：最近 `MIN_KEEP` 轮留原文，更早的卷入摘要（LLM 增量合并旧摘要+溢出轮次）。
+5. 摘要提示词**强制保留**过敏史/慢病史/正在用药/急症信号/用户声明禁忌（医疗安全信息不丢）。
+6. `save_summary`：回写 `summary` + 推进 `summary_msg_id` + `DEL` Redis 热缓存。
+
+### 10.3 读路径（`load_context` = 本项目的 Context Manager）
+
+归属裁决 → 读水位 → 取水位后原文（Redis 三级命中 / MySQL 回源）→ `turns[-HISTORY_MAX_TURNS:]` 轮次上限
+→ `trim_turns_to_budget` **token 级滑窗**（从最新往前装，装满预算即止，保底最近 2 轮）
+→ 首部注入 `{role:"summary"}` → `format_history` 渲染为【更早对话摘要】段 → 注入各 Agent 提示词。
+
+计数策略：tiktoken cl100k_base（对 Qwen 偏高估=保守方向，宁可少装不超窗口），离线降级启发式（CJK≈1 token/字）。
+
+### 10.4 配置契约（`config/settings.py`）
+
+| 配置                          | 默认 | 说明                             |
+| ----------------------------- | ---- | -------------------------------- |
+| `HISTORY_MAX_TURNS`         | 12   | 热缓存/上下文轮次硬上限          |
+| `HISTORY_MAX_TOKENS`        | 3000 | 注入提示词的历史段 token 预算    |
+| `HISTORY_SUMMARY_MIN_KEEP`  | 4    | 增量摘要时至少原文保留的最近轮次 |
+| `HISTORY_SUMMARY_MAX_CHARS` | 600  | 滚动摘要硬截断保险丝             |
+
+## 11. 可观测与 Tracing 设计（2026-09 新增）
+
+**目标**：生产路径与离线评估（evals）共用同一套可观测钩子；请求级 span 树可查、可追溯、可排障。
+
+**实现**（`src/common/observe.py`，生产与评估共用）：
+
+| 组件                         | 契约                                                                                                                   |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `trace_span(name, **meta)` | 请求/用例级业务 span 上下文管理器；元数据携带 request_id / session_id / user_id / query → intent / duration_ms / ok   |
+| `get_callbacks()`          | Agent 层 LangChain callbacks：Langfuse 模式返回 CallbackHandler（补内层 LLM 调用树）；LangSmith / no-op 模式返回空列表 |
+| 后端选择                     | `LANGFUSE_*` → Langfuse；否则 `LANGSMITH_TRACING` → LangSmith；否则 **no-op（零开销）**                    |
+
+**接线点**：
+
+- `routes.py` 两个问诊端点包 `trace_span` 请求级 span（异常穿越 with 时同样 flush）；
+- `graph.run / run_stream` 增加 `callbacks` 参数透传（`app.invoke/stream(config={"callbacks": ...})`）；
+- LangSmith 依赖 langchain 的 env 自动 trace，原生产出完整调用树（节点 → LLM → tool_calls），无需额外代码。
+
+**配置契约**（`.env`）：
+
+| 配置                                          | 说明                                                                   |
+| --------------------------------------------- | ---------------------------------------------------------------------- |
+| `LANGSMITH_TRACING`                         | 开关（true 启用）                                                      |
+| `LANGSMITH_ENDPOINT`                        | 美云默认`https://api.smith.langchain.com`；EU/自托管才需改           |
+| `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` | 密钥 / 控制台项目名                                                    |
+| `LANGFUSE_*`（三行）                        | 自托管备选，**配置后优先于 LangSmith**（医疗合规数据不出域推荐） |
+
+**工程红线**：
+
+1. 所有后端调用 try/except 包裹——**绝不因可观测失败打断请求/评估**（降级记 `logs/observe.log`）；
+2. `.env` 必须 `load_dotenv` 进 `os.environ`（pydantic-settings 只注入 Settings 对象；observe/SDK 经 os.getenv 读 env，不补这步配置不生效）；
+3. 可观测与主链路无事务关系，上报失败静默丢弃。
+
+**验收**：发一条问诊后 LangSmith 控制台 Traces 视图可见 `consult` 请求级 span + `LangGraph` 自动树（含 `tools → search_knowledge_graph` 工具轨迹）；env 未配置时行为完全不变（no-op）。
+
+## 12. 二级答案缓存设计（2026-09 新增）
+
+**目标**：命中即直返**完整响应**（含免责声明），跳过 LLM 与检索；未命中走 Agent 全链路并异步写回。**医疗数据强制用户隔离**，绝不跨用户、不跨上下文串答。
+
+**核心思想**：缓存前先由 **Cacheability Rule** 判定（纯正则、微秒级、零 LLM/嵌入调用），把问题路由到正确的缓存域；误判方向刻意保守——宁可漏命中（走全链路），绝不跨上下文串答。
+
+```
+                 Query
+                   ↓
+          Cacheability Rule
+                   ↓
+     ┌─────────────┴─────────────┐
+     ↓                           ↓
+上下文/强个性化                通用稳定
+（指代/接续/省略）          （自包含问题）
+     ↓                           ↓
+L1 Session 缓存            L1 User 精确
+（仅本会话）                     ↓ miss
+     ↓ miss                   L2 User 语义
+   Agent                        ↓ miss
+                              Agent
+```
+
+**实现**（`src/common/answer_cache.py`，对外只暴露三个接口）：
+
+| 组件                                                 | 契约                                                                                                                                                                                                                                                              |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `classify(query)`                                  | Cacheability Rule → 返回`"session"` / `"user"`。指代词（这个/那个/它的/上述/你说的…）、接续词开头（那…/还有…/另外…，「那」后须跟典型接续字避免误伤"那格列奈"药名）、省略式短问（怎么办/严重吗/吃什么…）→ `session` 域；其余自包含问题 → `user` 域 |
+| `lookup(query, user_id, session_id)`               | 返回`(层级, 完整响应)` 或 `None`。session 域只查 L1 会话键（**不做语义兜底**，防跨上下文串答）；user 域查 L1 用户键 → miss 再查 L2 语义                                                                                                                |
+| `store_async(query, payload, user_id, session_id)` | 后台守护线程异步写对应域（按`classify` 结果）；失败仅记日志，不打断主链路                                                                                                                                                                                       |
+
+**三把钥匙（全部含 `user_id`，绝不跨用户）**：
+
+| 缓存         | Key / 匹配依据                            | Scope          | 适合场景                                 |
+| ------------ | ----------------------------------------- | -------------- | ---------------------------------------- |
+| L1 Session   | `ans:{版本}:su:{user}:{session}:{sha1}` | 仅本会话       | "那平时要注意什么""这个药呢"等上下文追问 |
+| L1 User 精确 | `ans:{版本}:u:{user}:{sha1}`            | 跨会话、仅本人 | 用户重复问相同问题                       |
+| L2 User 语义 | BGE-M3 余弦 ≥0.92，只在本用户条目内匹配  | 跨会话、仅本人 | 同一用户相似问法                         |
+
+**阈值为何 0.92 从严（实测）**：真改写如"失眠脱发挂什么科"与"挂什么号"相似度仅 0.88；而危险对"孕妇感冒了能吃什么药"与"感冒了能吃什么药"高达 **0.868**——阈值降到 0.87 以下会跨人群串答。故 L2 只收近同义问法，用改写召回率换医疗安全。
+
+**接线点**：
+
+- `routes.py` 两个问诊端点：Agent 执行前调 `lookup`，命中直接构建响应（`cached=true`、重算 `duration_ms`），**照常落对话历史**（否则下一轮上下文断裂）；生成成功后调 `store_async`。
+- stream 端点命中时发一帧 `progress {node:"answer_cache"}` + `answer` 帧（不新增帧类型，前端渲染零改动）。
+- `models.py` `ConsultationResponse` 增加 `cached: bool`，前端显示 ⚡ 缓存命中徽章。
+- docker-compose 的 `redis` 服务加 `command: redis-server --appendonly yes` + 数据卷——缓存键须扛机器重启。
+
+**配置契约**（`.env` / `settings.py`，默认开启）：
+
+| 配置                           | 说明                                               |
+| ------------------------------ | -------------------------------------------------- |
+| `CACHE_ENABLED`              | 总开关（跑评估基线对比可设 false）                 |
+| `CACHE_VERSION`              | 命名空间版本号，知识库/图谱重建后 +1 即整体失效    |
+| `CACHE_L1_TTL_SECONDS`       | L1 TTL（默认 24h），仅兜底，版本更新才是主失效手段 |
+| `CACHE_SIMILARITY_THRESHOLD` | L2 余弦阈值（默认 0.92，医疗从严）                 |
+| `CACHE_L2_MAX_ENTRIES`       | L2 容量上限（默认 256，超出最旧淘汰）              |
+
+**工程红线**：
+
+1. 缓存的是**完整响应**（含免责声明）——命中即合规，医疗红线不丢；
+2. 请求路径上**不做同步网络/LLM 调用**（可观测曾因同步上报阻塞响应 20+s，见 §11 教训），写入一律后台线程异步；
+3. 命中也要落对话历史，否则下一轮上下文断裂；
+4. 缓存可缺不可幻——Redis/嵌入/磁盘任一故障均降级直通，绝不打断问诊主链路。
+
+**边界（诚实声明）**：本项目**不做 L3（RAG/Tool 结果缓存）**——问诊链路检索开销可控，收益抵不上复杂度。L2 对真改写（换词不换义）召回有限，是刻意用召回率换医疗安全；如需提升改写命中，演进方向是问法归一化而非调低阈值。
+
+**验收**：新会话首问 miss 并写回；跨会话重复同问命中 L1（<5ms）；近同义改写命中 L2（sim≥0.92）；"那平时要注意什么"类追问仅本会话命中、不跨会话；不同用户问同一问题必须 miss（用户隔离）；`docker restart redis` 后仍命中（AOF）；`CACHE_ENABLED=false` 行为与无缓存完全一致。
+
+## 13. 图执行态持久化设计（checkpointer，2026-10 新增）
+
+实现：`src/agents/checkpointer.py`；挂载点：`src/agents/graph.py` 的 `app = graph.compile(checkpointer=...)`。
+
+### 13.1 定位边界（先划清，否则一定讲混）
+
+| | 事实源 | 是否可丢弃 | 承载内容 |
+|---|---|---|---|
+| MySQL `messages`/`conversations`（§10） | ✅ **是** | ❌ 不可 | 对话转写、滚动摘要、摘要水位 |
+| Redis `sess:{sid}`（§10） | ❌ 派生缓存 | ✅ 可 | 最近 N 轮热缓存 |
+| **checkpoint SQLite（本节）** | ❌ **不是事实源** | ✅ **可丢弃、可重建** | 单次请求内的 **AgentState 执行态快照**（意图/症状/科室/免责…） |
+
+**三条硬边界**（与讲义 day05 §6.7「存储 ≠ 记忆」「三层记忆」同源，互为佐证）：
+
+1. **checkpoint 不承担跨轮记忆**。跨轮连续性只来自短期记忆：`load_context` → `state["history"]` → 注入提示词。
+2. **工作记忆的定义没变**，仍是 `AgentState`；本节的增量是它**变得可持久化、可中断恢复、可回溯**。
+   不许表述成"加了 checkpoint 才有工作记忆"。
+3. 删除整个 checkpoint 库，系统行为**完全不变**（只是失去中断恢复与回溯）——这是"非事实源"的可验证判据。
+
+### 13.2 thread_id 契约（R1：唯一主人 = `build_thread_id()`）
+
+```python
+# src/agents/checkpointer.py —— 全项目唯一构造点，任何模块不得自行拼接
+thread_id = f"user_{user_id}__session_{session_id}"
+```
+
+| 规则 | 约束 | 违反后果 |
+|---|---|---|
+| 必须含 `user_id` | 取自 `src/auth/deps.py` 的 `User.id`（JWT 解析，前端不可伪造） | 用户 B 猜到 B 的 session_id 即可 resume 到 A 中断的图、读到 A 的医疗中间态 |
+| API 层唯一入口 | `run(query, history, callbacks, thread_id)` / `run_stream(...)` | 裸调 `app.invoke` 不带 thread_id → LangGraph 直接 `ValueError` |
+| 无用户上下文的调用 | 传 `None`，由 `run()` 生成 `anon:<uuid12>` 并在 `end_turn` 删除 | 评测 harness / 模块自测零改动；不清则 checkpoint 库无界增长 |
+| 归属裁决 | 仍走 §10 的三道防线（`load_context` 先裁决） | 越权统一 404，不泄露会话存在性 |
+
+### 13.3 轮次生命周期：一轮一线程 + 轮首清空（关键工程决策）
+
+**为什么必须清空**：`AgentState` 有 10 个 `Annotated[list, operator.add]` 累加字段（symptoms / departments / medications / advice / disclaimers / warnings / retrieved_entities / retrieved_contexts / linked_entities / messages——以 `src/agents/state.py` 为准，数一下即可复现）。同一 thread 上第二次 `invoke`，LangGraph 会把新结果**追加**到旧值——实测 `symptoms` 由 `['头痛']` 变 `['头痛','头痛']`，免责声明同样翻倍。这既是数据错误也是医疗风险（上一轮建议混进本轮答案）。自测 `[3]` 就是在复现这个事故并证明 `begin_turn` 修掉了它。
+
+| 动作 | 调用 | 语义 |
+|---|---|---|
+| 新提问 | `begin_turn(thread_id)` → `delete_thread` | 清掉上一轮执行态，本轮从干净状态起跑 |
+| 评测/脚本跑完 | `end_turn(thread_id)` | 仅删 `anon:` 线程，用户线程保留（供排障/回溯） |
+| **HITL 恢复（演进钩子）** | **不调 `begin_turn`**，直接 `Command(resume=...)` | resume 必须接着跑中断时那份快照；误调 begin_turn 会把待审状态删掉 |
+
+**刻意接受的代价**：不做跨轮 time-travel（每轮独立快照），保留轮内逐步检查点（`get_thread_history`）。与"工作记忆只活在单次请求内"的既有口径一致；将来要跨轮回溯，把 thread_id 升级为带轮次序号即可，属兼容性演进。
+
+### 13.4 配置契约（`config/settings.py`）
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `checkpoint_enabled` | `true` | 置 `false` → `get_checkpointer()` 返回 `None` → `compile()` 回退无持久化老路径（可对照实验，拓扑完全一致） |
+| `checkpoint_db_path` | `data/checkpoints/agent_checkpoints.sqlite` | 相对路径按项目根解析；**运行时产物 + 含用户医疗问答内容 → 已进 `.gitignore`，永不提交** |
+
+### 13.5 实现约束（踩过的坑，写进契约防回归）
+
+1. **线程池共享连接**：API 经 `run_in_executor` / `asyncio.to_thread` 调用，SQLite 连接默认禁止跨线程 → 必须 `sqlite3.connect(..., check_same_thread=False)`，全进程共用一个 `SqliteSaver`（双检锁单例）。`SqliteSaver` 内部自带 `threading.Lock` 串行化游标、`setup()` 已开 `PRAGMA journal_mode=WAL`。
+2. **只调公开 API**：清理用 `saver.list()` + `saver.delete_thread()`，**不写死 `checkpoints`/`writes` 表名与列**——直接 SQL 会随 `langgraph-checkpoint` 升级静默失效（首版就踩过：绕过 `setup()` 导致 `no such table`）。
+3. **降级不阻断主链路**：`begin_turn` / `end_turn` / `prune_threads` / 两个检视函数全部 `try/except` + `logger.warning`。执行态清理失败绝不能让问诊报错（"缓存可缺不可幻"的同一原则）。
+4. **依赖显式声明**：`requirements.txt` 加 `langgraph-checkpoint-sqlite==3.1.1`（此前 `langgraph-checkpoint` 只是传递依赖、装了也没用）。
+
+### 13.6 可观测面
+
+`get_thread_state(thread_id)` → 回读持久化快照；`get_thread_history(thread_id, limit)` → 轮内检查点列表（已完成节点 / intent / symptoms / 消息步数）；`describe_thread(thread_id)` → `hit|empty @ 路径`，进日志。这三个函数是 HITL 待审面板与课堂"看 Agent 到底算了什么"的共用底座。
+
+### 13.7 验收（R7 模块自检）
+
+```bash
+# 零 LLM、零中间件，可在无 API Key 环境跑；失败退出码非 0
+python src/agents/checkpointer.py
+# 真实图挂载 + 执行态回读断言（需 MODEL_API_KEY + Neo4j）
+python src/agents/graph.py
+python scripts/check_contracts.py --no-db    # R1/R3 不受影响（未新增响应字段、未新增枚举）
+```
+
+自测覆盖五项：thread_id 契约与用户隔离、落盘后重开连接仍可读（=「重启不丢」）、累加事故复现与 `begin_turn` 修复、单例与配置路径契约、真实图 `app.checkpointer is not None`。
+
+---
+
+**文档版本**：v3.3
 **创建日期**：2026-07-24
-**最后更新**：2026-07-24
-**状态**：已完成 ✅
+**最后更新**：2026-10-05
+**状态**：已对齐当前代码 ✅（V2 认证 + V3 上下文预算 + 可观测 tracing + 二级答案缓存 + §13 执行态持久化）
