@@ -54,7 +54,7 @@ class VectorRetriever:
         self,
         index_path: Path = FAISS_INDEX_FILE,
         entities_path: Path = ENTITIES_MAPPING_FILE,
-        score_threshold: float = 0.5
+        score_threshold: Optional[float] = None
     ):
         """
         Initialize the vector retriever
@@ -62,11 +62,16 @@ class VectorRetriever:
         Args:
             index_path: Path to FAISS index file
             entities_path: Path to entity mapping JSON file
-            score_threshold: Minimum similarity score (default: 0.5)
+            score_threshold: Minimum similarity score. None → 取
+                settings.vector_score_threshold（可经 .env 的
+                VECTOR_SCORE_THRESHOLD 调整；标定依据见 config/settings.py）。
+                此前该值硬编码 0.5，越界提问也能命中伪相关实体，故改为可配置。
         """
         self.index_path = index_path
         self.entities_path = entities_path
-        self.score_threshold = score_threshold
+        self.score_threshold = (
+            settings.vector_score_threshold if score_threshold is None else score_threshold
+        )
 
         self.index = None
         self.entities = []
@@ -313,7 +318,7 @@ class VectorRetriever:
         链接到知识图谱中的规范实体。
 
         与 search() 的定位区别：
-        - search() 面向"召回"（阈值 0.5），结果用于构建检索上下文
+        - search() 面向"召回"（阈值 settings.vector_score_threshold），结果用于构建检索上下文
         - link_entities() 面向"精确"（阈值默认 0.85），只输出高置信链接，
           用于 state 记录、Text2Cypher 实体提示（entity hints）与前端展示
 

@@ -202,13 +202,26 @@ def prepare_texts(entities: list[dict]) -> tuple[list[str], list[dict]]:
     """
     Prepare texts for embedding and entity mapping
 
+    去重（2026-10-17）：上游 entities.json 按"疾病-关系实例"展开，同一实体会被
+    多条关系重复登记（实测 6789 条仅 4643 个唯一文本，「外科」重复 72 次）。
+    重复文本 → 重复向量 → FAISS 的 top-k 候选位被同一实体的副本占满，
+    经检索层按 name 去重后 search(top_k=5) 实际只剩 1~3 个实体（实测「胸口疼
+    喘不上气」10 个候选全是"胸痛"）。故此处按 (type, text) 去重、保留首次出现
+    的记录，向量与候选位一一对应不同实体。
+
+    去重键含 type：同名不同类（高血压同时是 Disease/Symptom，实测 158 个）
+    不合并——那是上游抽取的类型标注问题，不该由索引层抹平。
+
     Returns:
         (texts, entity_mapping)
     """
     texts = []
     entity_mapping = []
+    seen: set[tuple[str, str]] = set()
+    dup = 0
+    empty = 0
 
-    for idx, entity in enumerate(entities):
+    for entity in entities:
         entity_type = entity.get("type", "")
         data = entity.get("data", {})
 
@@ -222,16 +235,28 @@ def prepare_texts(entities: list[dict]) -> tuple[list[str], list[dict]]:
         else:
             text = name
 
-        if text.strip():
-            texts.append(text)
-            entity_mapping.append({
-                "index": len(texts) - 1,
-                "type": entity_type,
-                "name": name,
-                "data": data
-            })
+        if not text.strip():
+            empty += 1
+            continue
 
-    logger.info(f"[PREPARE] Prepared {len(texts)} texts for embedding")
+        key = (entity_type, text)
+        if key in seen:
+            dup += 1
+            continue
+        seen.add(key)
+
+        texts.append(text)
+        entity_mapping.append({
+            "index": len(texts) - 1,
+            "type": entity_type,
+            "name": name,
+            "data": data
+        })
+
+    logger.info(
+        f"[PREPARE] Prepared {len(texts)} unique texts for embedding "
+        f"(输入 {len(entities)} 条，去重丢弃 {dup} 条副本，空文本 {empty} 条)"
+    )
     return texts, entity_mapping
 
 

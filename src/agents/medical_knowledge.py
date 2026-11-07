@@ -168,7 +168,13 @@ class MedicalKnowledgeAgent:
     # ---------------- Step 1: 强制混合检索（grounding 底线，必走） ----------------
     def _retrieve(self, text: str, retriever=None):
         """确定性强制检索：FAISS 语义召回(+Neo4j 精确) → 按类型扩展 Neo4j 事实。
-        返回 (contexts, used_hits)。绝不抛异常；contexts 为空 == 知识库未覆盖。
+        返回 (contexts, used_hits, top_score)。绝不抛异常。
+
+        top_score = 检索命中的最高相似度（无命中为 0.0）。**必须带出去**：
+        候选生成阈值 settings.vector_score_threshold 只有 0.5，在归一化余弦尺度上
+        几乎不设防（越界提问也能捞到 0.5~0.6 的伪相关实体），所以
+        「contexts 非空」≠「知识库已覆盖」。覆盖判定改用 top_score 走
+        settings.grounding_coverage_threshold，由调用方分流时判。
 
         Args:
             text: 检索文本
@@ -181,6 +187,8 @@ class MedicalKnowledgeAgent:
             hits = vr.search(text, top_k=5) or []
         except Exception as e:
             logger.warning(f"[MedicalKnowledge] vector retrieval failed: {e}")
+
+        top_score = max((float(h.get("score", 0.0)) for h in hits), default=0.0)
 
         contexts, used, seen = [], [], set()
         try:
@@ -203,7 +211,7 @@ class MedicalKnowledgeAgent:
             q.close()
         except Exception as e:
             logger.warning(f"[MedicalKnowledge] graph expansion failed: {e}")
-        return contexts, used
+        return contexts, used, top_score
 
     # ---------------- ReAct 解析辅助 ----------------
     @staticmethod
@@ -270,8 +278,17 @@ class MedicalKnowledgeAgent:
             retriever = get_shared_retriever()
         except Exception as e:
             logger.warning(f"[MedicalKnowledge] retriever init failed: {e}")
-        contexts, used = self._retrieve(user_text, retriever=retriever)
-        logger.info(f"[MedicalKnowledge] forced retrieval: entities={[h.get('name') for h in used]} ctx={len(contexts)}")
+        contexts, used, ctx_top = self._retrieve(user_text, retriever=retriever)
+        # 覆盖判定（双阈值中的第二道）：分数门为主、事实数量旁路为辅。
+        # 候选生成阈值只有 0.5，越界提问也能捞出伪相关实体，因此
+        # contexts 非空 ≠ 已覆盖——必须在这里再判一次，否则 grounded 生成会拿
+        # 一条"症状可能对应的疾病：X、Y"去答一个需要科室/检查/用药的问题（编造来源）。
+        covered = (len(contexts) >= settings.grounding_min_contexts
+                   or ctx_top >= settings.grounding_coverage_threshold)
+        logger.info(
+            f"[MedicalKnowledge] forced retrieval: entities={[h.get('name') for h in used]} "
+            f"ctx={len(contexts)} top_score={ctx_top:.3f} covered={covered}"
+        )
 
         # Step 2：显式实体链接（高精度：用户表述/检索命中 → 图谱规范实体锚点）
         # terms = 本轮症状 + 检索命中实体名 + 问题本身。
@@ -310,7 +327,7 @@ class MedicalKnowledgeAgent:
         # Step 2/3：生成（grounded+ReAct / 纯 grounded / 分风险兜底）
         tool_calls, mode = [], ""
         try:
-            if contexts:
+            if contexts and covered:
                 if self.react_enabled:
                     answer, tool_ctxs, tool_calls = self._react_answer(
                         user_text, contexts, entity_hints=hints_text
@@ -322,10 +339,12 @@ class MedicalKnowledgeAgent:
                     mode = "grounded"
             elif _is_high_risk(query):
                 answer = SAFE_DEFERRAL.format(query=query)
-                mode = "defer-high-risk"
+                # 区分"什么都没检索到"与"检索到了但覆盖不足"——两者都转诊，
+                # 但后者是检索/图谱质量问题，日志里必须能分开看
+                mode = "defer-high-risk" if not contexts else "defer-low-coverage"
             else:
                 answer = self._general_llm(user_text)
-                mode = "general-fallback"
+                mode = "general-fallback" if not contexts else "general-low-coverage"
         except Exception as e:
             logger.error(f"[MedicalKnowledge] generation error: {e}")
             answer, mode = _FALLBACK, "error"
@@ -337,7 +356,8 @@ class MedicalKnowledgeAgent:
             "retrieved_contexts": contexts,                   # list[str]，供 RAGAS faithfulness/context
             "linked_entities": linked,                        # list[dict]，实体链接结果（API/前端展示）
             "messages": [f"[MedicalKnowledge] mode={mode} entities={[h.get('name') for h in used]} "
-                         f"ctx={len(contexts)} tools={tool_calls} "
+                         f"ctx={len(contexts)} covered={covered} top_score={ctx_top:.3f} "
+                         f"tools={tool_calls} "
                          f"linked={[lk['matched_entity'] for lk in linked]}"],
         }
 

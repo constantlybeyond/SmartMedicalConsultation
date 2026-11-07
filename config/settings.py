@@ -213,6 +213,39 @@ class Settings(BaseSettings):
                     "已进 .gitignore，永不提交。"
     )
 
+    # ===== Vector Retrieval Configuration（双阈值：候选生成 / 覆盖判定分离）=====
+    vector_score_threshold: float = Field(
+        default=0.5,
+        description="FAISS 语义检索的**候选生成**阈值（归一化余弦，向量已 L2 归一化 → IP ≡ cosine）。"
+                    "低于此分的候选不进 search() 结果，也就不参与 Neo4j 事实扩展。\n"
+                    "为什么是 0.5 而不是更高（2026-10-18 实测回退）：曾标定到 0.65，"
+                    "越界查询放行确实从 29/40 降到 5/40，但在 19 条真实知识类评测用例上"
+                    "平均候选从 9.5 条跌到 2.8 条、4 条被清零，其中包含"
+                    "『吃头孢能喝酒吗』(top1=0.630)、『二甲双胍一般怎么吃』(0.590) 这类"
+                    "高风险用药问题——grounded 生成被直接饿死。"
+                    "候选层的分数过滤不是拦越界的正确位置：拦越界交给下方 "
+                    "grounding_coverage_threshold 在分流处做，两边互不伤害。\n"
+                    "注意 0.5 在归一化余弦尺度上几乎不设防（任何无关短文本与中文实体名"
+                    "普遍 0.5~0.6），因此**绝不能**用 search() 结果非空来判断知识库是否覆盖。"
+    )
+    grounding_coverage_threshold: float = Field(
+        default=0.65,
+        description="grounding 覆盖判定门（用于 src/agents/medical_knowledge.py 的生成方式分流）："
+                    "检索命中实体的最高相似度 ≥ 此值，才认为知识库真正覆盖了该问题、"
+                    "可以走 grounded 生成；否则按'未覆盖'处理（高风险→明确转诊，"
+                    "非高风险→通用作答并声明依据不足）。\n"
+                    "0.65 依据 2026-10-18 在去重索引（5719 向量）上的标定："
+                    "越界查询（天气/编程/宠物/乱码等 40 条）top1 P50=0.53 P95=0.67 max=0.72；"
+                    "而真实用药/预后类问题 top1 落在 0.58~0.68，故必须配合 "
+                    "grounding_min_contexts 旁路，避免误杀'分数不高但事实给得足'的用例。"
+    )
+    grounding_min_contexts: int = Field(
+        default=3,
+        description="覆盖判定门的旁路条件：Neo4j 事实上下文达到此条数即视为已覆盖，"
+                    "不再受 coverage 分数门限制。图谱事实充足而分数偏低是可接受的"
+                    "（长口语整句对短实体名的余弦天然偏低），此时该用事实数量而非分数判覆盖。"
+    )
+
     # ===== Entity Linking Configuration =====
     entity_link_threshold: float = Field(
         default=0.85,
